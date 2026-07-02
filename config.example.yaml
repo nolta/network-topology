@@ -1,0 +1,16 @@
+# Copy this file to config.yaml and fill in your real community string.
+# config.yaml is gitignored so credentials never get committed.
+
+snmp_version: "2c"
+community: "public"          # <-- replace with your real SNMPv2c community string
+timeout_seconds: 3
+retries: 1
+
+switches:
+  - 10.10.50.10
+  - 10.10.50.11
+  - 10.10.50.12
+  - 10.10.50.13
+  - 10.10.50.14
+  - 10.10.50.15
+  - 10.10.50.16
