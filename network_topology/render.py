@@ -81,6 +81,54 @@ def write_dot(topo: Topology, path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def _clustered_layout(g: nx.Graph) -> dict:
+    """Switches on an inner ring; each switch's own leaf devices fanned out
+    in a wedge around it on an outer ring (alternating radius to reduce
+    label overlap), instead of one global force layout for every node."""
+    import math
+
+    switch_ids = sorted(n for n, d in g.nodes(data=True) if d.get("kind") == "switch")
+    n_switches = max(len(switch_ids), 1)
+    switch_radius = 4.0
+    leaf_radius = switch_radius + 2.2
+    leaf_radius_jitter = 1.0
+
+    pos = {}
+    switch_angle = {}
+    for i, sid in enumerate(switch_ids):
+        angle = 2 * math.pi * i / n_switches
+        switch_angle[sid] = angle
+        pos[sid] = (switch_radius * math.cos(angle), switch_radius * math.sin(angle))
+
+    leaves_by_switch: dict[str, list[str]] = {sid: [] for sid in switch_ids}
+    orphans = []
+    for n, d in g.nodes(data=True):
+        if d.get("kind") == "switch":
+            continue
+        home = next((nb for nb in g.neighbors(n) if nb in switch_angle), None)
+        if home:
+            leaves_by_switch[home].append(n)
+        else:
+            orphans.append(n)
+
+    wedge = (2 * math.pi / n_switches) * 0.85
+    for sid, leaves in leaves_by_switch.items():
+        base_angle = switch_angle[sid]
+        count = len(leaves)
+        for i, leaf in enumerate(sorted(leaves)):
+            offset = 0.0 if count == 1 else (i / (count - 1) - 0.5) * wedge
+            angle = base_angle + offset
+            radius = leaf_radius + (leaf_radius_jitter if i % 2 else 0.0)
+            pos[leaf] = (radius * math.cos(angle), radius * math.sin(angle))
+
+    outer_radius = leaf_radius + 2 * leaf_radius_jitter
+    for i, n in enumerate(sorted(orphans)):
+        angle = 2 * math.pi * i / max(len(orphans), 1)
+        pos[n] = (outer_radius * math.cos(angle), outer_radius * math.sin(angle))
+
+    return pos
+
+
 def write_png(topo: Topology, path: Path) -> None:
     g = nx.Graph()
     for dev in topo.devices.values():
@@ -91,17 +139,21 @@ def write_png(topo: Topology, path: Path) -> None:
             link.device_b,
             label=f"{link.port_a} - {link.port_b}".strip(" -"),
             kind=link.kind,
+            is_backbone=(
+                topo.devices[link.device_a].kind == "switch"
+                and topo.devices[link.device_b].kind == "switch"
+            ),
         )
 
-    pos = nx.spring_layout(g, seed=42, k=1.4)
+    pos = _clustered_layout(g)
 
-    plt.figure(figsize=(16, 12))
+    plt.figure(figsize=(22, 22))
 
     for kind, color in _KIND_COLOR.items():
         nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == kind]
         if not nodes:
             continue
-        size = 1800 if kind == "switch" else 700
+        size = 2400 if kind == "switch" else 500
         nx.draw_networkx_nodes(
             g, pos, nodelist=nodes, node_color=color, node_size=size,
             edgecolors="#333333", linewidths=1.0,
@@ -110,17 +162,26 @@ def write_png(topo: Topology, path: Path) -> None:
     lldp_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "lldp"]
     switch_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred-switch"]
     inferred_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred"]
-    nx.draw_networkx_edges(g, pos, edgelist=lldp_edges, width=1.6, edge_color="#333333")
-    nx.draw_networkx_edges(g, pos, edgelist=switch_edges, width=2.2, edge_color="#fb8500")
+    nx.draw_networkx_edges(g, pos, edgelist=lldp_edges, width=1.2, edge_color="#333333", alpha=0.8)
+    nx.draw_networkx_edges(g, pos, edgelist=switch_edges, width=2.8, edge_color="#fb8500")
     nx.draw_networkx_edges(
-        g, pos, edgelist=inferred_edges, width=1.0, edge_color="#999999", style="dashed"
+        g, pos, edgelist=inferred_edges, width=0.8, edge_color="#999999", style="dashed", alpha=0.7
     )
 
-    labels = {n: d["label"] for n, d in g.nodes(data=True)}
-    nx.draw_networkx_labels(g, pos, labels=labels, font_size=8)
+    switch_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "switch"}
+    leaf_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") != "switch"}
+    nx.draw_networkx_labels(g, pos, labels=switch_labels, font_size=10, font_weight="bold")
+    nx.draw_networkx_labels(g, pos, labels=leaf_labels, font_size=7)
 
-    edge_labels = {(u, v): d["label"] for u, v, d in g.edges(data=True) if d.get("label")}
-    nx.draw_networkx_edge_labels(g, pos, edge_labels=edge_labels, font_size=6)
+    # Only label the switch-to-switch backbone -- labeling every leaf edge
+    # is what made the old layout unreadable; per-host port info is still
+    # in links.csv.
+    backbone_edge_labels = {
+        (u, v): d["label"] for u, v, d in g.edges(data=True) if d.get("is_backbone") and d.get("label")
+    }
+    nx.draw_networkx_edge_labels(
+        g, pos, edge_labels=backbone_edge_labels, font_size=8, font_color="#8a4300"
+    )
 
     plt.axis("off")
     plt.tight_layout()

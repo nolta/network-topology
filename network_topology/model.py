@@ -192,10 +192,12 @@ def build_topology(switches: list[SwitchData]) -> Topology:
 
     all_switch_macs = set(mac_to_switch_ip.keys())
 
+    sys_name_counts = Counter(sw.sys_name.strip().lower() for sw in switches if sw.sys_name)
     for sw in switches:
-        topo.add_device(
-            Device(id=_switch_id(sw.ip), label=sw.sys_name or sw.ip, kind="switch", ip=sw.ip)
-        )
+        label = sw.sys_name or sw.ip
+        if sw.sys_name and sys_name_counts[sw.sys_name.strip().lower()] > 1:
+            label = f"{sw.sys_name} ({sw.ip})"  # disambiguate duplicate default hostnames
+        topo.add_device(Device(id=_switch_id(sw.ip), label=label, kind="switch", ip=sw.ip))
 
     # --- Pass 1: LLDP-derived links ---
     for sw in switches:
