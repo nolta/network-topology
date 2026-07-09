@@ -1,10 +1,11 @@
 """Pull everything we need from one switch over SNMP."""
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 
 from . import mibs
-from .snmp import get, hexstring_to_mac, normalize_mac, walk
+from .snmp import SnmpError, get, hexstring_to_mac, normalize_mac, walk
 
 
 @dataclass
@@ -67,8 +68,22 @@ def collect_switch(
     version: str = "2c",
     timeout: int = 3,
     retries: int = 1,
+    max_repetitions: int = 10,
+    pace_seconds: float = 0.0,
 ) -> SwitchData:
     data = SwitchData(ip=host)
+
+    def _walk(oid: str):
+        result = walk(host, community, oid, version, timeout, retries, max_repetitions)
+        if pace_seconds:
+            time.sleep(pace_seconds)
+        return result
+
+    def _walk_optional(oid: str):
+        try:
+            return _walk(oid)
+        except SnmpError:
+            return {}
 
     sys_name_vb = get(host, community, mibs.SYS_NAME, version, timeout, retries)
     data.sys_name = sys_name_vb.value if sys_name_vb else host
@@ -82,30 +97,26 @@ def collect_switch(
     if loc_chassis_subtype_vb and loc_chassis_id_vb:
         data.chassis_id = _decode_id(loc_chassis_subtype_vb.value, loc_chassis_id_vb)
 
-    if_name = walk(host, community, mibs.IF_NAME, version, timeout, retries)
-    if_descr = walk(host, community, mibs.IF_DESCR, version, timeout, retries)
+    if_name = _walk(mibs.IF_NAME)
+    if_descr = _walk(mibs.IF_DESCR)
     for ifindex, vb in if_descr.items():
         data.ifindex_to_name[ifindex] = vb.value
     for ifindex, vb in if_name.items():
         if vb.value:
             data.ifindex_to_name[ifindex] = vb.value
 
-    if_phys = walk(host, community, mibs.IF_PHYS_ADDRESS, version, timeout, retries)
+    if_phys = _walk(mibs.IF_PHYS_ADDRESS)
     for ifindex, vb in if_phys.items():
         if vb.type == "Hex-STRING":
             data.ifindex_to_mac[ifindex] = hexstring_to_mac(vb.value)
 
-    bridge_port_ifindex = walk(
-        host, community, mibs.DOT1D_BASE_PORT_IF_INDEX, version, timeout, retries
-    )
+    bridge_port_ifindex = _walk(mibs.DOT1D_BASE_PORT_IF_INDEX)
     for bport, vb in bridge_port_ifindex.items():
         data.bridge_port_to_ifindex[bport] = vb.value
 
-    lldp_loc_id_subtype = walk(
-        host, community, mibs.LLDP_LOC_PORT_ID_SUBTYPE, version, timeout, retries
-    )
-    lldp_loc_id = walk(host, community, mibs.LLDP_LOC_PORT_ID, version, timeout, retries)
-    lldp_loc_desc = walk(host, community, mibs.LLDP_LOC_PORT_DESC, version, timeout, retries)
+    lldp_loc_id_subtype = _walk(mibs.LLDP_LOC_PORT_ID_SUBTYPE)
+    lldp_loc_id = _walk(mibs.LLDP_LOC_PORT_ID)
+    lldp_loc_desc = _walk(mibs.LLDP_LOC_PORT_DESC)
     # Union across all three columns: some vendors don't implement every
     # column (e.g. lldpLocPortIdSubtype missing entirely on some Planet
     # models), so keying off just one column can silently drop every port.
@@ -121,17 +132,13 @@ def collect_switch(
             "desc": desc_vb.value if desc_vb else "",
         }
 
-    rem_chassis_subtype = walk(
-        host, community, mibs.LLDP_REM_CHASSIS_ID_SUBTYPE, version, timeout, retries
-    )
-    rem_chassis_id = walk(host, community, mibs.LLDP_REM_CHASSIS_ID, version, timeout, retries)
-    rem_port_subtype = walk(
-        host, community, mibs.LLDP_REM_PORT_ID_SUBTYPE, version, timeout, retries
-    )
-    rem_port_id = walk(host, community, mibs.LLDP_REM_PORT_ID, version, timeout, retries)
-    rem_port_desc = walk(host, community, mibs.LLDP_REM_PORT_DESC, version, timeout, retries)
-    rem_sys_name = walk(host, community, mibs.LLDP_REM_SYS_NAME, version, timeout, retries)
-    rem_sys_desc = walk(host, community, mibs.LLDP_REM_SYS_DESC, version, timeout, retries)
+    rem_chassis_subtype = _walk(mibs.LLDP_REM_CHASSIS_ID_SUBTYPE)
+    rem_chassis_id = _walk(mibs.LLDP_REM_CHASSIS_ID)
+    rem_port_subtype = _walk(mibs.LLDP_REM_PORT_ID_SUBTYPE)
+    rem_port_id = _walk(mibs.LLDP_REM_PORT_ID)
+    rem_port_desc = _walk(mibs.LLDP_REM_PORT_DESC)
+    rem_sys_name = _walk(mibs.LLDP_REM_SYS_NAME)
+    rem_sys_desc = _walk(mibs.LLDP_REM_SYS_DESC)
 
     for index_suffix, chassis_subtype_vb in rem_chassis_subtype.items():
         # index_suffix = timeMark.localPortNum.remIndex
@@ -152,8 +159,12 @@ def collect_switch(
         )
         data.lldp_remote.append(entry)
 
-    fdb_port = walk(host, community, mibs.DOT1D_TP_FDB_PORT, version, timeout, retries)
-    fdb_status = walk(host, community, mibs.DOT1D_TP_FDB_STATUS, version, timeout, retries)
+    fdb_port = _walk(mibs.DOT1D_TP_FDB_PORT)
+    # Optional: some switch models (e.g. the 24-port Planet IGS-6325-24P4X
+    # in this network) reliably time out on this specific table. Fall back
+    # to treating all learned FDB entries as valid rather than losing the
+    # whole switch's data over one refinement column.
+    fdb_status = _walk_optional(mibs.DOT1D_TP_FDB_STATUS)
     for index_suffix, port_vb in fdb_port.items():
         status_vb = fdb_status.get(index_suffix)
         if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
@@ -163,7 +174,7 @@ def collect_switch(
         mac = _mac_from_fdb_index(index_suffix)
         data.fdb.append((mac, port_vb.value))
 
-    arp = walk(host, community, mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS, version, timeout, retries)
+    arp = _walk(mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS)
     for index_suffix, vb in arp.items():
         if vb.type != "Hex-STRING":
             continue

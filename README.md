@@ -66,5 +66,18 @@ python -m network_topology --config config.yaml --output output
 - Requires `snmpbulkwalk`/`snmpget` from net-snmp on your PATH (already
   present on this machine).
 - All OIDs used are numeric, so no MIB files need to be installed.
-- If a switch doesn't respond within `timeout_seconds` × `retries`, it's
-  skipped with a warning rather than aborting the whole run.
+- If a switch doesn't respond within `timeout_seconds` × `retries`, its
+  whole collection is retried up to `switch_retries` times (default 1,
+  i.e. no retry) before being skipped with a warning. Some Planet models
+  in this network are flaky under sustained SNMP load -- the failure
+  isn't tied to one fixed table, it moves around between different OIDs
+  from run to run, so `switch_retries` (retrying the whole switch) has
+  proven more effective than tuning any single request's parameters.
+- `max_repetitions` (rows per GETBULK PDU, default 10) and `pace_seconds`
+  (delay between each table walk on a switch, default 0) are also
+  available if you want to trade collection speed for gentler treatment
+  of a weak/embedded agent, though in this network they didn't resolve
+  the flakiness on their own.
+- `dot1dTpFdbStatus` (used to filter FDB entries to "learned" ones) is
+  treated as optional: if it fails, all FDB entries are used unfiltered
+  rather than losing the whole switch's data over one refinement column.

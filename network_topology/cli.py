@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 import yaml
@@ -35,15 +36,32 @@ def main() -> int:
     community = config["community"]
     timeout = int(config.get("timeout_seconds", 3))
     retries = int(config.get("retries", 1))
+    max_repetitions = int(config.get("max_repetitions", 10))
+    pace_seconds = float(config.get("pace_seconds", 0.0))
+    switch_retries = int(config.get("switch_retries", 1))
     switch_ips = config["switches"]
 
     switches = []
     for ip in switch_ips:
         print(f"Collecting SNMP data from {ip} ...", file=sys.stderr)
-        try:
-            data = collect_switch(ip, community, version, timeout, retries)
-        except SnmpError as exc:
-            print(f"  WARNING: failed to collect from {ip}: {exc}", file=sys.stderr)
+        data = None
+        last_exc = None
+        for attempt in range(1, switch_retries + 1):
+            try:
+                data = collect_switch(
+                    ip, community, version, timeout, retries, max_repetitions, pace_seconds
+                )
+                break
+            except SnmpError as exc:
+                last_exc = exc
+                if attempt < switch_retries:
+                    print(
+                        f"  attempt {attempt}/{switch_retries} failed ({exc}), retrying...",
+                        file=sys.stderr,
+                    )
+                    time.sleep(2)
+        if data is None:
+            print(f"  WARNING: failed to collect from {ip}: {last_exc}", file=sys.stderr)
             continue
         print(f"  -> {data.sys_name}: {len(data.lldp_remote)} LLDP neighbors, "
               f"{len(data.fdb)} FDB entries", file=sys.stderr)

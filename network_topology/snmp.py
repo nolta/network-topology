@@ -62,8 +62,14 @@ def walk(
     version: str = "2c",
     timeout: int = 3,
     retries: int = 1,
+    max_repetitions: int = 10,
 ) -> dict[str, SnmpVarBind]:
-    """Walk base_oid on host, return {index_suffix: SnmpVarBind}."""
+    """Walk base_oid on host, return {index_suffix: SnmpVarBind}.
+
+    max_repetitions controls GETBULK's row count per PDU (-Cr). Weak
+    embedded agents can choke assembling large bulk responses; lowering
+    this trades more round-trips for a better chance each one succeeds.
+    """
     cmd = [
         "snmpbulkwalk",
         "-v",
@@ -75,11 +81,15 @@ def walk(
         str(timeout),
         "-r",
         str(retries),
+        f"-Cr{max_repetitions}",
         host,
         base_oid,
     ]
+    # Safety net for the whole walk (many GETBULK round-trips over a
+    # possibly high-latency link), not just one PDU -- but bounded so a
+    # single stuck table can't silently eat minutes.
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 30 + 10)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 8 + 10)
     except subprocess.TimeoutExpired as exc:
         raise SnmpError(f"snmpbulkwalk timed out talking to {host}") from exc
 
