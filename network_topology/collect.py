@@ -1,14 +1,21 @@
 """Pull everything we need from one switch over SNMP."""
 from __future__ import annotations
 
+import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from datetime import datetime, timezone
+from pathlib import Path
 
 from . import mibs
 from .snmp import SnmpError, get, hexstring_to_mac, normalize_mac, walk
 
 logger = logging.getLogger(__name__)
+
+# Bump when the SwitchData/LldpRemoteEntry shape changes so stale caches
+# are rejected rather than silently mis-loaded.
+_CACHE_VERSION = 1
 
 
 @dataclass
@@ -36,6 +43,40 @@ class SwitchData:
     lldp_remote: list = field(default_factory=list)  # list[LldpRemoteEntry]
     fdb: list = field(default_factory=list)  # list[(mac, bridge_port)]
     arp: dict = field(default_factory=dict)  # mac -> ip
+
+
+def save_switches(switches: list[SwitchData], path: Path) -> None:
+    """Persist raw collected data to JSON so diagrams can be regenerated
+    without re-running the (slow) SNMP collection. Caching the raw
+    SwitchData -- not the derived topology -- means a re-plot also picks up
+    any later changes to the model/merge or rendering logic."""
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "version": _CACHE_VERSION,
+        "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "switches": [asdict(sw) for sw in switches],
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def load_switches(path: Path) -> tuple[list[SwitchData], str]:
+    """Load switches saved by save_switches. Returns (switches,
+    collected_at). Raises ValueError on an unknown cache version."""
+    payload = json.loads(Path(path).read_text())
+    version = payload.get("version")
+    if version != _CACHE_VERSION:
+        raise ValueError(
+            f"cache {path} has version {version!r}, this build expects {_CACHE_VERSION}; "
+            "re-run a full collection to refresh it"
+        )
+    switches = []
+    for d in payload["switches"]:
+        d = dict(d)
+        d["lldp_remote"] = [LldpRemoteEntry(**e) for e in d.get("lldp_remote", [])]
+        d["fdb"] = [tuple(pair) for pair in d.get("fdb", [])]  # JSON lists -> tuples
+        switches.append(SwitchData(**d))
+    return switches, payload.get("collected_at", "unknown")
 
 
 def _decode_id(subtype: str, vb) -> str:

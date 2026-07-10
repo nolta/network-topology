@@ -51,6 +51,24 @@ stays traceable even when switches are collected concurrently:
 python -m network_topology --config config.yaml --output output -v
 ```
 
+### Re-plotting without re-collecting
+
+Each run caches the raw collected data to `<output>/collected.json`. To
+regenerate the diagram and CSVs from that cache -- instantly, with no SNMP
+collection and no network access -- pass `--replot`:
+
+```
+python -m network_topology --output output --replot
+```
+
+This is the fast way to iterate on the diagram (e.g. after tweaking colors
+or layout) or to re-run the link-inference logic without waiting on the
+(slow, high-latency) collection. Because the *raw* per-switch data is
+cached -- not the finished diagram -- a re-plot also picks up any code
+changes to the topology model or renderer. The log line reports when the
+cached data was collected, so you know how stale it is. `--replot` needs no
+config file.
+
 ## How link discovery works
 
 1. **LLDP-MIB** (`lldpRemTable`) is walked on every switch first. This is

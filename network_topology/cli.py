@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import json
 import logging
 import sys
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 
 import yaml
 
-from .collect import SwitchData, collect_switch
+from .collect import SwitchData, collect_switch, load_switches, save_switches
 from .model import build_topology
 from .render import render_all
 from .snmp import SnmpError
@@ -61,6 +62,11 @@ def main() -> int:
         help="Log every individual SNMP request (host, table, timing, success/failure) "
              "to help pinpoint exactly where and why a switch's collection is failing.",
     )
+    parser.add_argument(
+        "--replot", action="store_true",
+        help="Skip SNMP collection and rebuild the diagram/CSVs from the cached data "
+             "(<output>/collected.json) written by a previous run. Fast; no network access.",
+    )
     args = parser.parse_args()
 
     # Root stays quiet so third-party libraries (matplotlib, etc.) don't
@@ -80,45 +86,69 @@ def main() -> int:
     )
     pkg_logger.addHandler(handler)
 
-    if not args.config.exists():
-        logger.error(
-            "Config file %s not found. Copy config.example.yaml to %s and fill in "
-            "your SNMP community string.",
-            args.config, args.config,
+    cache_path = args.output / "collected.json"
+
+    if args.replot:
+        # Rebuild diagram/CSVs from previously collected data -- no network,
+        # no config needed. Picks up any code changes to the model/render.
+        if not cache_path.exists():
+            logger.error(
+                "--replot: no cached data at %s. Run a collection first (without --replot).",
+                cache_path,
+            )
+            return 1
+        try:
+            switches, collected_at = load_switches(cache_path)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            logger.error("failed to load cached data %s: %s", cache_path, exc)
+            return 1
+        logger.info(
+            "Re-plotting from cache %s (%d switches, collected %s) -- no SNMP collection.",
+            cache_path, len(switches), collected_at,
         )
-        return 1
+    else:
+        if not args.config.exists():
+            logger.error(
+                "Config file %s not found. Copy config.example.yaml to %s and fill in "
+                "your SNMP community string.",
+                args.config, args.config,
+            )
+            return 1
 
-    config = yaml.safe_load(args.config.read_text())
-    version = str(config.get("snmp_version", "2c"))
-    community = config["community"]
-    timeout = int(config.get("timeout_seconds", 3))
-    retries = int(config.get("retries", 1))
-    max_repetitions = int(config.get("max_repetitions", 10))
-    pace_seconds = float(config.get("pace_seconds", 0.0))
-    switch_retries = int(config.get("switch_retries", 1))
-    max_concurrency = int(config.get("max_concurrency", 8))
-    switch_ips = config["switches"]
+        config = yaml.safe_load(args.config.read_text())
+        version = str(config.get("snmp_version", "2c"))
+        community = config["community"]
+        timeout = int(config.get("timeout_seconds", 3))
+        retries = int(config.get("retries", 1))
+        max_repetitions = int(config.get("max_repetitions", 10))
+        pace_seconds = float(config.get("pace_seconds", 0.0))
+        switch_retries = int(config.get("switch_retries", 1))
+        max_concurrency = int(config.get("max_concurrency", 8))
+        switch_ips = config["switches"]
 
-    # Each switch is collected independently and is I/O-bound (blocking on
-    # net-snmp subprocesses, which release the GIL), so a thread pool
-    # collects them concurrently. Results are gathered by IP and re-ordered
-    # to match config order so output stays deterministic run-to-run.
-    workers = max(1, min(max_concurrency, len(switch_ips)))
-    logger.debug("collecting %d switches with up to %d concurrent workers", len(switch_ips), workers)
-    args_for = lambda ip: (
-        ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
-    )
-    results_by_ip: dict = {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
-        futures = {executor.submit(_collect_with_retry, *args_for(ip)): ip for ip in switch_ips}
-        for fut in concurrent.futures.as_completed(futures):
-            results_by_ip[futures[fut]] = fut.result()
+        # Each switch is collected independently and is I/O-bound (blocking on
+        # net-snmp subprocesses, which release the GIL), so a thread pool
+        # collects them concurrently. Results are gathered by IP and re-ordered
+        # to match config order so output stays deterministic run-to-run.
+        workers = max(1, min(max_concurrency, len(switch_ips)))
+        logger.debug("collecting %d switches with up to %d concurrent workers", len(switch_ips), workers)
+        args_for = lambda ip: (
+            ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
+        )
+        results_by_ip: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {executor.submit(_collect_with_retry, *args_for(ip)): ip for ip in switch_ips}
+            for fut in concurrent.futures.as_completed(futures):
+                results_by_ip[futures[fut]] = fut.result()
 
-    switches = [results_by_ip[ip] for ip in switch_ips if results_by_ip.get(ip) is not None]
+        switches = [results_by_ip[ip] for ip in switch_ips if results_by_ip.get(ip) is not None]
 
-    if not switches:
-        logger.error("No switches responded, nothing to build.")
-        return 1
+        if not switches:
+            logger.error("No switches responded, nothing to build.")
+            return 1
+
+        save_switches(switches, cache_path)
+        logger.debug("cached raw collected data to %s", cache_path)
 
     topo = build_topology(switches)
     render_all(topo, args.output)
