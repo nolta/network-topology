@@ -9,6 +9,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import networkx as nx
+from matplotlib.lines import Line2D
 
 from .model import Topology
 
@@ -23,6 +24,19 @@ _KIND_SHAPE = {  # networkx doesn't do per-node shapes easily; used for dot only
     "lldp-endpoint": "ellipse",
     "host": "ellipse",
     "hub": "diamond",
+}
+# Human-readable legend labels for each node kind (what the color means).
+_KIND_LABEL = {
+    "switch": "Switch",
+    "lldp-endpoint": "LLDP-identified device (named)",
+    "host": "Host: single MAC, via FDB/ARP (unnamed)",
+    "hub": "Unidentified: multiple MACs behind one port",
+}
+# Legend labels and draw styles for each edge kind: (label, color, linestyle, width).
+_EDGE_LEGEND = {
+    "lldp": ("LLDP link (confirmed port-to-port)", "#333333", "solid", 1.6),
+    "inferred-switch": ("Inferred switch uplink (FDB correlation)", "#fb8500", "solid", 2.8),
+    "inferred": ("Inferred host/hub attachment (FDB/ARP)", "#999999", "dashed", 1.0),
 }
 
 
@@ -149,10 +163,12 @@ def write_png(topo: Topology, path: Path) -> None:
 
     plt.figure(figsize=(22, 22))
 
+    present_node_kinds = []
     for kind, color in _KIND_COLOR.items():
         nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == kind]
         if not nodes:
             continue
+        present_node_kinds.append(kind)
         size = 2400 if kind == "switch" else 500
         nx.draw_networkx_nodes(
             g, pos, nodelist=nodes, node_color=color, node_size=size,
@@ -167,6 +183,10 @@ def write_png(topo: Topology, path: Path) -> None:
     nx.draw_networkx_edges(
         g, pos, edgelist=inferred_edges, width=0.8, edge_color="#999999", style="dashed", alpha=0.7
     )
+    present_edge_kinds = [
+        k for k, e in (("lldp", lldp_edges), ("inferred-switch", switch_edges), ("inferred", inferred_edges))
+        if e
+    ]
 
     switch_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "switch"}
     leaf_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") != "switch"}
@@ -183,10 +203,37 @@ def write_png(topo: Topology, path: Path) -> None:
         g, pos, edge_labels=backbone_edge_labels, font_size=8, font_color="#8a4300"
     )
 
+    _draw_legend(present_node_kinds, present_edge_kinds)
+
     plt.axis("off")
     plt.tight_layout()
     plt.savefig(path, dpi=150)
     plt.close()
+
+
+def _draw_legend(present_node_kinds: list, present_edge_kinds: list) -> None:
+    """Legend mapping node color -> what it means and edge style -> how the
+    link was discovered. Only shows entries actually present in this
+    diagram so unused categories don't clutter it."""
+    handles = []
+    for kind in present_node_kinds:
+        handles.append(
+            Line2D(
+                [], [], marker="o", linestyle="none", markersize=13,
+                markerfacecolor=_KIND_COLOR[kind], markeredgecolor="#333333",
+                label=_KIND_LABEL[kind],
+            )
+        )
+    for kind in present_edge_kinds:
+        label, color, style, width = _EDGE_LEGEND[kind]
+        handles.append(Line2D([], [], color=color, linestyle=style, linewidth=width, label=label))
+
+    if not handles:
+        return
+    plt.legend(
+        handles=handles, loc="upper left", fontsize=11, title="Legend",
+        title_fontsize=12, frameon=True, framealpha=0.95, borderpad=1.0, labelspacing=0.8,
+    )
 
 
 def render_all(topo: Topology, output_dir: Path) -> None:
