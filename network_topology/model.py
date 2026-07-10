@@ -44,6 +44,11 @@ class Device:
     ip: str = ""
     mac: str = ""
     notes: str = ""
+    # For "hub" devices only: the individual (mac, ip) pairs learned behind
+    # that single port. The renderer fans these out as child nodes behind
+    # the hub pseudo-node to show they share one uplink to the switch. Not
+    # written to devices.csv (the hub stays one row there).
+    members: list = field(default_factory=list)
 
 
 @dataclass
@@ -326,6 +331,7 @@ def build_topology(switches: list[SwitchData]) -> Topology:
                     label=f"unidentified device ({len(macs)} MACs behind port)",
                     kind="hub",
                     notes=notes,
+                    members=[(m, global_arp.get(m, "")) for m in macs],
                 )
             )
             topo.add_link(

@@ -92,7 +92,12 @@ config file.
      switch-to-switch uplink (drawn as a thick orange edge). Otherwise it
      stays an "unidentified device" node, with the vote breakdown kept in
      its notes as a hint (e.g. "possible uplink toward: 10.10.50.11:
-     9/50") for manual tracing.
+     9/50") for manual tracing. In the diagram this node is drawn as an
+     orange pseudo-node with a **single** link to the switch and the
+     individual MACs fanned out behind it -- making explicit that those
+     devices share one physical uplink (an inferred unmanaged switch/hub,
+     or one device presenting several MACs). In `devices.csv` it stays a
+     single row (MACs listed in its `notes`).
    - This correlation only works when a switch has *some* confirmed leaf
      hosts to vote with, and breaks down on ports whose traffic passes
      through multiple further switch hops (the vote gets split across

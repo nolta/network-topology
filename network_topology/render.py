@@ -115,9 +115,13 @@ def _clustered_layout(g: nx.Graph) -> dict:
         pos[sid] = (switch_radius * math.cos(angle), switch_radius * math.sin(angle))
 
     leaves_by_switch: dict[str, list[str]] = {sid: [] for sid in switch_ids}
+    members_by_hub: dict[str, list[str]] = {}
     orphans = []
     for n, d in g.nodes(data=True):
         if d.get("kind") == "switch":
+            continue
+        if d.get("kind") == "behind-hub":
+            members_by_hub.setdefault(d.get("member_of"), []).append(n)
             continue
         home = next((nb for nb in g.neighbors(n) if nb in switch_angle), None)
         if home:
@@ -140,13 +144,32 @@ def _clustered_layout(g: nx.Graph) -> dict:
         angle = 2 * math.pi * i / max(len(orphans), 1)
         pos[n] = (outer_radius * math.cos(angle), outer_radius * math.sin(angle))
 
+    # Fan each hub's member devices out just beyond the hub, on the far side
+    # from its switch, so it reads as "one uplink, several devices behind it".
+    for hub_id, members in members_by_hub.items():
+        if hub_id not in pos:
+            continue
+        hx, hy = pos[hub_id]
+        home_sw = next((nb for nb in g.neighbors(hub_id) if nb in switch_angle), None)
+        sx, sy = pos[home_sw] if home_sw else (0.0, 0.0)
+        dx, dy = hx - sx, hy - sy
+        norm = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / norm, dy / norm  # outward unit vector (switch -> hub)
+        px, py = -uy, ux               # perpendicular, for spreading the fan
+        count = len(members)
+        step, spread = 1.2, 1.5
+        for i, m in enumerate(sorted(members)):
+            t = 0.0 if count == 1 else (i / (count - 1) - 0.5)
+            pos[m] = (hx + ux * step + px * t * spread, hy + uy * step + py * t * spread)
+
     return pos
 
 
 def write_png(topo: Topology, path: Path) -> None:
     g = nx.Graph()
     for dev in topo.devices.values():
-        g.add_node(dev.id, **dev.__dict__)
+        attrs = {k: v for k, v in dev.__dict__.items() if k != "members"}
+        g.add_node(dev.id, **attrs)
     for link in topo.links:
         g.add_edge(
             link.device_a,
@@ -158,6 +181,19 @@ def write_png(topo: Topology, path: Path) -> None:
                 and topo.devices[link.device_b].kind == "switch"
             ),
         )
+
+    # Expand each hub pseudo-node: fan its member devices out behind it so
+    # the single uplink to the switch is visually explicit. Diagram-only --
+    # devices.csv keeps the hub as one row.
+    member_edges = []
+    for dev in topo.devices.values():
+        if dev.kind != "hub" or not dev.members:
+            continue
+        for mac, ip in dev.members:
+            mid = f"{dev.id}::{mac}"
+            g.add_node(mid, kind="behind-hub", label=(ip or mac), member_of=dev.id)
+            g.add_edge(dev.id, mid, kind="member")
+            member_edges.append((dev.id, mid))
 
     pos = _clustered_layout(g)
 
@@ -175,6 +211,14 @@ def write_png(topo: Topology, path: Path) -> None:
             edgecolors="#333333", linewidths=1.0,
         )
 
+    # Member devices behind a hub: small, white (unnamed single MACs).
+    member_nodes = [n for n, d in g.nodes(data=True) if d.get("kind") == "behind-hub"]
+    if member_nodes:
+        nx.draw_networkx_nodes(
+            g, pos, nodelist=member_nodes, node_color="#ffffff", node_size=250,
+            edgecolors="#999999", linewidths=0.8,
+        )
+
     lldp_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "lldp"]
     switch_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred-switch"]
     inferred_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred"]
@@ -183,15 +227,22 @@ def write_png(topo: Topology, path: Path) -> None:
     nx.draw_networkx_edges(
         g, pos, edgelist=inferred_edges, width=0.8, edge_color="#999999", style="dashed", alpha=0.7
     )
+    # hub -> member links: thin amber to visually group them under the hub.
+    nx.draw_networkx_edges(g, pos, edgelist=member_edges, width=0.6, edge_color="#d9a441", alpha=0.7)
     present_edge_kinds = [
         k for k, e in (("lldp", lldp_edges), ("inferred-switch", switch_edges), ("inferred", inferred_edges))
         if e
     ]
 
     switch_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "switch"}
-    leaf_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") != "switch"}
+    leaf_labels = {
+        n: d["label"] for n, d in g.nodes(data=True)
+        if d.get("kind") not in ("switch", "behind-hub")
+    }
+    member_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "behind-hub"}
     nx.draw_networkx_labels(g, pos, labels=switch_labels, font_size=10, font_weight="bold")
     nx.draw_networkx_labels(g, pos, labels=leaf_labels, font_size=7)
+    nx.draw_networkx_labels(g, pos, labels=member_labels, font_size=6)
 
     # Only label the switch-to-switch backbone -- labeling every leaf edge
     # is what made the old layout unreadable; per-host port info is still
