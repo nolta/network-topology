@@ -108,8 +108,7 @@ config file.
 
 ## Notes
 
-- Requires `snmpbulkwalk`/`snmpget` from net-snmp on your PATH (already
-  present on this machine).
+- Requires `snmpbulkwalk`/`snmpget` from net-snmp on your PATH.
 - All OIDs used are numeric, so no MIB files need to be installed.
 - **Why Q-BRIDGE instead of the classic BRIDGE-MIB FDB:** the legacy
   `dot1dTpFdbTable` is indexed by MAC address only. A VLAN-aware switch
