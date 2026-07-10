@@ -8,6 +8,7 @@ retries: 1
 max_repetitions: 10   # lower (e.g. 5) if your switches' SNMP agents are weak/embedded
 pace_seconds: 0       # delay between each SNMP table walk on a switch, if agents choke on rapid requests
 switch_retries: 1     # retry a switch's whole collection this many times before giving up on it
+max_concurrency: 8    # collect up to this many switches at once (set to 1 for serial, tidy per-switch verbose output)
 
 switches:
   - 10.10.50.10

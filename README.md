@@ -32,11 +32,20 @@ source .venv/bin/activate
 python -m network_topology --config config.yaml --output output
 ```
 
+Switches are collected **concurrently** (up to `max_concurrency` at once),
+so the total runtime is bound by the slowest switch rather than the sum of
+all of them. Over a high-latency path this is a big win. Note that higher
+concurrency also multiplies the packet rate through a shared uplink (e.g. a
+VPN/subnet router), which can *increase* loss and retries -- if you see
+that, lower `max_concurrency`. Set it to `1` for strictly serial collection
+(and tidy, non-interleaved `-v` output).
+
 Add `-v`/`--verbose` to see every individual SNMP request as it happens --
 target host, table name, parameters, timing, and success/failure for each
 one. Useful for pinpointing exactly where and why a switch's collection is
 failing (which table, how long it took before timing out, etc.) rather than
-just seeing the final summary error:
+just seeing the final summary error. Every log line names its host, so it
+stays traceable even when switches are collected concurrently:
 
 ```
 python -m network_topology --config config.yaml --output output -v

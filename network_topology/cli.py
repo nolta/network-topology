@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
 import logging
 import sys
 import time
@@ -8,12 +9,43 @@ from pathlib import Path
 
 import yaml
 
-from .collect import collect_switch
+from .collect import SwitchData, collect_switch
 from .model import build_topology
 from .render import render_all
 from .snmp import SnmpError
 
 logger = logging.getLogger(__name__)
+
+
+def _collect_with_retry(
+    ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
+) -> SwitchData | None:
+    """Collect one switch, retrying the whole collection up to
+    switch_retries times. Returns None (and logs a warning) if it never
+    succeeds. Safe to run concurrently: it shares no mutable state and
+    every log line names the host, so interleaved output stays traceable."""
+    logger.info("Collecting SNMP data from %s ...", ip)
+    last_exc = None
+    for attempt in range(1, switch_retries + 1):
+        try:
+            data = collect_switch(
+                ip, community, version, timeout, retries, max_repetitions, pace_seconds
+            )
+            logger.info(
+                "  -> %s (%s): %d LLDP neighbors, %d FDB entries",
+                data.sys_name, ip, len(data.lldp_remote), len(data.fdb),
+            )
+            return data
+        except SnmpError as exc:
+            last_exc = exc
+            if attempt < switch_retries:
+                logger.info(
+                    "  %s attempt %d/%d failed (%s), retrying...",
+                    ip, attempt, switch_retries, exc,
+                )
+                time.sleep(2)
+    logger.warning("  WARNING: failed to collect from %s: %s", ip, last_exc)
+    return None
 
 
 def main() -> int:
@@ -64,34 +96,25 @@ def main() -> int:
     max_repetitions = int(config.get("max_repetitions", 10))
     pace_seconds = float(config.get("pace_seconds", 0.0))
     switch_retries = int(config.get("switch_retries", 1))
+    max_concurrency = int(config.get("max_concurrency", 8))
     switch_ips = config["switches"]
 
-    switches = []
-    for ip in switch_ips:
-        logger.info("Collecting SNMP data from %s ...", ip)
-        data = None
-        last_exc = None
-        for attempt in range(1, switch_retries + 1):
-            try:
-                data = collect_switch(
-                    ip, community, version, timeout, retries, max_repetitions, pace_seconds
-                )
-                break
-            except SnmpError as exc:
-                last_exc = exc
-                if attempt < switch_retries:
-                    logger.info(
-                        "  attempt %d/%d failed (%s), retrying...", attempt, switch_retries, exc
-                    )
-                    time.sleep(2)
-        if data is None:
-            logger.warning("  WARNING: failed to collect from %s: %s", ip, last_exc)
-            continue
-        logger.info(
-            "  -> %s: %d LLDP neighbors, %d FDB entries",
-            data.sys_name, len(data.lldp_remote), len(data.fdb),
-        )
-        switches.append(data)
+    # Each switch is collected independently and is I/O-bound (blocking on
+    # net-snmp subprocesses, which release the GIL), so a thread pool
+    # collects them concurrently. Results are gathered by IP and re-ordered
+    # to match config order so output stays deterministic run-to-run.
+    workers = max(1, min(max_concurrency, len(switch_ips)))
+    logger.debug("collecting %d switches with up to %d concurrent workers", len(switch_ips), workers)
+    args_for = lambda ip: (
+        ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
+    )
+    results_by_ip: dict = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = {executor.submit(_collect_with_retry, *args_for(ip)): ip for ip in switch_ips}
+        for fut in concurrent.futures.as_completed(futures):
+            results_by_ip[futures[fut]] = fut.result()
+
+    switches = [results_by_ip[ip] for ip in switch_ips if results_by_ip.get(ip) is not None]
 
     if not switches:
         logger.error("No switches responded, nothing to build.")
