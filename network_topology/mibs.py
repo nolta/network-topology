@@ -16,8 +16,21 @@ IF_NAME = ".1.3.6.1.2.1.31.1.1.1.1"  # ifIndex -> ifName (ifXTable, usually shor
 
 # BRIDGE-MIB
 DOT1D_BASE_PORT_IF_INDEX = ".1.3.6.1.2.1.17.1.4.1.2"  # bridge port -> ifIndex
+# Legacy (non-VLAN-aware) forwarding table. Indexed by 6-byte MAC only.
+# VLAN-aware switches must synthesize this in software from the per-VLAN
+# hardware FDB and sort it by MAC for lexicographic SNMP walks -- an
+# O(n^2) software operation that pegs the management CPU on switches with
+# large FDBs. Prefer the Q-BRIDGE-MIB table below; keep these only as a
+# fallback for switches that don't implement Q-BRIDGE.
 DOT1D_TP_FDB_PORT = ".1.3.6.1.2.1.17.4.3.1.2"  # index = 6-byte MAC -> bridge port
 DOT1D_TP_FDB_STATUS = ".1.3.6.1.2.1.17.4.3.1.3"  # index = 6-byte MAC -> status (3 = learned)
+
+# Q-BRIDGE-MIB (802.1Q). Per-VLAN forwarding table, matching the switch's
+# native hardware layout, so the agent serves it cheaply. Index is
+# dot1qFdbId(VLAN).<6-byte MAC>. The port value is still a dot1dBasePort,
+# so it maps through DOT1D_BASE_PORT_IF_INDEX the same way.
+DOT1Q_TP_FDB_PORT = ".1.3.6.1.2.1.17.7.1.2.2.1.2"  # index = VLAN.6-byte MAC -> bridge port
+DOT1Q_TP_FDB_STATUS = ".1.3.6.1.2.1.17.7.1.2.2.1.3"  # index = VLAN.6-byte MAC -> status (3 = learned)
 
 # IP-MIB (ARP table)
 IP_NET_TO_MEDIA_PHYS_ADDRESS = ".1.3.6.1.2.1.4.22.1.2"  # index = ifIndex.ipAddress -> MAC

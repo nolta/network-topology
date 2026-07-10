@@ -48,10 +48,13 @@ python -m network_topology --config config.yaml --output output -v
    authoritative: it gives the exact local and remote port for every link
    between two LLDP-speaking devices (switch-to-switch, and switch to any
    LLDP-capable endpoint like an AP or VoIP phone).
-2. For ports LLDP has no data on, the **BRIDGE-MIB forwarding table**
-   (`dot1dTpFdbTable`) is used to see which MAC addresses were learned on
+2. For ports LLDP has no data on, the **Q-BRIDGE-MIB forwarding table**
+   (`dot1qTpFdbTable`) is used to see which MAC addresses were learned on
    each port, cross-referenced against the **ARP table**
-   (`ipNetToMediaTable`) to resolve MACs to IPs where possible.
+   (`ipNetToMediaTable`) to resolve MACs to IPs where possible. (The tool
+   prefers the per-VLAN Q-BRIDGE table over the legacy MAC-only
+   `dot1dTpFdbTable` and only falls back to the latter if a switch doesn't
+   implement Q-BRIDGE -- see the note below on why.)
    - A port with exactly one learned MAC is a confirmed direct host link.
    - A port with more than one learned MAC is ambiguous on its own (could
      be an unmanaged switch/hub, or a trunk toward another of your known
@@ -76,18 +79,29 @@ python -m network_topology --config config.yaml --output output -v
 - Requires `snmpbulkwalk`/`snmpget` from net-snmp on your PATH (already
   present on this machine).
 - All OIDs used are numeric, so no MIB files need to be installed.
-- If a switch doesn't respond within `timeout_seconds` × `retries`, its
-  whole collection is retried up to `switch_retries` times (default 1,
-  i.e. no retry) before being skipped with a warning. Some Planet models
-  in this network are flaky under sustained SNMP load -- the failure
-  isn't tied to one fixed table, it moves around between different OIDs
-  from run to run, so `switch_retries` (retrying the whole switch) has
-  proven more effective than tuning any single request's parameters.
-- `max_repetitions` (rows per GETBULK PDU, default 10) and `pace_seconds`
-  (delay between each table walk on a switch, default 0) are also
-  available if you want to trade collection speed for gentler treatment
-  of a weak/embedded agent, though in this network they didn't resolve
-  the flakiness on their own.
-- `dot1dTpFdbStatus` (used to filter FDB entries to "learned" ones) is
-  treated as optional: if it fails, all FDB entries are used unfiltered
-  rather than losing the whole switch's data over one refinement column.
+- **Why Q-BRIDGE instead of the classic BRIDGE-MIB FDB:** the legacy
+  `dot1dTpFdbTable` is indexed by MAC address only. A VLAN-aware switch
+  has to synthesize it in software from its per-VLAN hardware FDB and
+  re-sort by MAC for each lexicographic SNMP walk step -- an O(n^2)
+  operation on the management CPU. On the 24-port Planet IGS-6325 switches
+  in this network with large FDBs, this pegged the CPU to 100% and timed
+  the walk out entirely (~16s to failure), which in turn starved the SNMP
+  agent and caused *seemingly random* collateral timeouts on whatever
+  request happened to run next. The per-VLAN `dot1qTpFdbTable` matches the
+  hardware layout and returned the same data in ~1s with no CPU spike.
+  Switching to it resolved the intermittent collection failures that
+  earlier request-level tuning (timeouts, retries, `max_repetitions`,
+  pacing) could not.
+- If a switch still doesn't respond within `timeout_seconds` × `retries`,
+  its whole collection is retried up to `switch_retries` times before
+  being skipped with a warning. Over a high-latency/lossy path (e.g. these
+  switches are reached via a ~165ms Tailscale subnet route) this is cheap
+  insurance against occasional packet loss.
+- `max_repetitions` (rows per GETBULK PDU) and `pace_seconds` (delay
+  between each table walk on a switch, default 0) are available for
+  gentler treatment of a weak agent, but shouldn't be needed now that the
+  FDB walk is cheap.
+- `dot1qTpFdbStatus`/`dot1dTpFdbStatus` (used to filter FDB entries to
+  "learned" ones) is treated as optional: if it fails, all FDB entries are
+  used unfiltered rather than losing the whole switch's data over one
+  refinement column.

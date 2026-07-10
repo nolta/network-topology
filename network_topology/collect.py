@@ -54,7 +54,16 @@ def _decode_id(subtype: str, vb) -> str:
 
 
 def _mac_from_fdb_index(index_suffix: str) -> str:
+    """dot1dTpFdbTable index = 6 MAC octets."""
     octets = index_suffix.split(".")
+    return ":".join(f"{int(o):02x}" for o in octets)
+
+
+def _mac_from_q_fdb_index(index_suffix: str) -> str:
+    """dot1qTpFdbTable index = dot1qFdbId(VLAN).<6 MAC octets>. Take the
+    trailing 6 octets; the leading VLAN id is a single dotted component
+    regardless of its magnitude."""
+    octets = index_suffix.split(".")[-6:]
     return ":".join(f"{int(o):02x}" for o in octets)
 
 
@@ -63,6 +72,53 @@ def _ip_from_arp_index(index_suffix: str) -> tuple[str, str]:
     parts = index_suffix.split(".")
     ifindex, ip_octets = parts[0], parts[1:5]
     return ifindex, ".".join(ip_octets)
+
+
+def _collect_fdb(host, data, _walk, _walk_optional) -> None:
+    """Populate data.fdb with (mac, bridge_port) pairs.
+
+    Prefers the Q-BRIDGE-MIB per-VLAN table (dot1qTpFdbTable): it matches
+    the switch's native hardware layout, so the agent serves it cheaply.
+    The legacy BRIDGE-MIB dot1dTpFdbTable forces a software flatten+sort
+    that can peg the management CPU (observed pegging 24-port Planet
+    IGS-6325 CPUs to 100% and timing the walk out entirely, vs ~1s for the
+    Q-BRIDGE table). We only fall back to dot1d if Q-BRIDGE returns
+    nothing, i.e. the switch doesn't implement it.
+
+    The Q-BRIDGE table has a VLAN dimension, so a MAC learned on a trunk
+    can appear once per VLAN; we dedupe identical (mac, port) pairs so a
+    port's learned-MAC count isn't inflated by that.
+    """
+    q_fdb_port = _walk_optional(mibs.DOT1Q_TP_FDB_PORT)
+    if q_fdb_port:
+        q_fdb_status = _walk_optional(mibs.DOT1Q_TP_FDB_STATUS)
+        seen = set()
+        for index_suffix, port_vb in q_fdb_port.items():
+            status_vb = q_fdb_status.get(index_suffix)
+            if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
+                continue
+            if port_vb.value == "0":
+                continue
+            mac = _mac_from_q_fdb_index(index_suffix)
+            pair = (mac, port_vb.value)
+            if pair in seen:
+                continue
+            seen.add(pair)
+            data.fdb.append(pair)
+        return
+
+    # Fallback: legacy BRIDGE-MIB (may be slow/CPU-heavy on some switches).
+    logger.debug("%s: Q-BRIDGE FDB empty, falling back to legacy dot1dTpFdbTable", host)
+    fdb_port = _walk(mibs.DOT1D_TP_FDB_PORT)
+    fdb_status = _walk_optional(mibs.DOT1D_TP_FDB_STATUS)
+    for index_suffix, port_vb in fdb_port.items():
+        status_vb = fdb_status.get(index_suffix)
+        if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
+            continue
+        if port_vb.value == "0":
+            continue
+        mac = _mac_from_fdb_index(index_suffix)
+        data.fdb.append((mac, port_vb.value))
 
 
 def collect_switch(
@@ -168,20 +224,7 @@ def collect_switch(
         )
         data.lldp_remote.append(entry)
 
-    fdb_port = _walk(mibs.DOT1D_TP_FDB_PORT)
-    # Optional: some switch models (e.g. the 24-port Planet IGS-6325-24P4X
-    # in this network) reliably time out on this specific table. Fall back
-    # to treating all learned FDB entries as valid rather than losing the
-    # whole switch's data over one refinement column.
-    fdb_status = _walk_optional(mibs.DOT1D_TP_FDB_STATUS)
-    for index_suffix, port_vb in fdb_port.items():
-        status_vb = fdb_status.get(index_suffix)
-        if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
-            continue
-        if port_vb.value == "0":
-            continue
-        mac = _mac_from_fdb_index(index_suffix)
-        data.fdb.append((mac, port_vb.value))
+    _collect_fdb(host, data, _walk, _walk_optional)
 
     arp = _walk(mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS)
     for index_suffix, vb in arp.items():
