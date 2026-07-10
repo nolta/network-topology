@@ -237,12 +237,17 @@ def write_png(topo: Topology, path: Path) -> None:
         g.add_edge(
             link.device_a,
             link.device_b,
-            label=f"{link.port_a} - {link.port_b}".strip(" -"),
             kind=link.kind,
             is_backbone=(
                 topo.devices[link.device_a].kind == "switch"
                 and topo.devices[link.device_b].kind == "switch"
             ),
+            # Keep which port belongs to which end, so backbone labels can be
+            # placed at the correct switch rather than as an ambiguous
+            # midpoint "A - B" string.
+            end_a=link.device_a,
+            port_a=link.port_a,
+            port_b=link.port_b,
         )
 
     # Expand each hub pseudo-node: fan its member devices out behind it so
@@ -325,15 +330,31 @@ def write_png(topo: Topology, path: Path) -> None:
             fontsize=6 if kind == "behind-hub" else 7,
         )
 
-    # Only label the switch-to-switch backbone -- labeling every leaf edge
-    # is what made the old layout unreadable; per-host port info is still
-    # in links.csv.
-    backbone_edge_labels = {
-        (u, v): d["label"] for u, v, d in g.edges(data=True) if d.get("is_backbone") and d.get("label")
-    }
-    nx.draw_networkx_edge_labels(
-        g, pos, edge_labels=backbone_edge_labels, font_size=8, font_color="#8a4300"
-    )
+    # Label the switch-to-switch backbone only (labeling every leaf edge made
+    # the layout unreadable; per-host port info is still in links.csv). Each
+    # port is drawn near ITS OWN switch end, not as a single midpoint "A - B"
+    # string -- otherwise the reader can't tell which port belongs to which
+    # switch (and it reads reversed depending on which side each switch fell).
+    for u, v, d in g.edges(data=True):
+        if not d.get("is_backbone"):
+            continue
+        u_is_a = u == d.get("end_a")
+        port_u = d["port_a"] if u_is_a else d["port_b"]
+        port_v = d["port_b"] if u_is_a else d["port_a"]
+        xu, yu = pos[u]
+        xv, yv = pos[v]
+        deg = math.degrees(math.atan2(yv - yu, xv - xu))
+        if deg > 90 or deg < -90:
+            deg += 180
+        for frac, port in ((0.18, port_u), (0.82, port_v)):
+            if not port:
+                continue
+            plt.text(
+                xu + (xv - xu) * frac, yu + (yv - yu) * frac, port,
+                rotation=deg, rotation_mode="anchor", ha="center", va="center",
+                fontsize=7, color="#8a4300",
+                bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
+            )
 
     _draw_legend(present_node_kinds, present_edge_kinds)
 
