@@ -127,20 +127,18 @@ def _clustered_layout(g: nx.Graph) -> dict:
     """Switches on an inner ring; each switch's own leaf devices fanned out
     in a wedge around it on an outer ring, all at a single radius so no two
     neighbours ever sit on the same ray from the switch (which read as one
-    being 'behind' the other). Labels are rotated radially at draw time to
-    stay legible without needing radius jitter."""
+    being 'behind' the other). Each switch's angular span is proportional to
+    how much it has attached, so busy switches get more room than sparse
+    ones. Labels are rotated radially at draw time to stay legible without
+    needing radius jitter."""
     switch_ids = sorted(n for n, d in g.nodes(data=True) if d.get("kind") == "switch")
+    switch_set = set(switch_ids)
     n_switches = max(len(switch_ids), 1)
     switch_radius = 4.0
     leaf_radius = switch_radius + 2.6
 
-    pos = {}
-    switch_angle = {}
-    for i, sid in enumerate(switch_ids):
-        angle = 2 * math.pi * i / n_switches
-        switch_angle[sid] = angle
-        pos[sid] = (switch_radius * math.cos(angle), switch_radius * math.sin(angle))
-
+    # Assign leaves/members to switches first (needs only graph membership,
+    # not positions), so we can size each switch's span by its load.
     leaves_by_switch: dict[str, list[str]] = {sid: [] for sid in switch_ids}
     members_by_hub: dict[str, list[str]] = {}
     orphans = []
@@ -150,19 +148,56 @@ def _clustered_layout(g: nx.Graph) -> dict:
         if d.get("kind") == "behind-hub":
             members_by_hub.setdefault(d.get("member_of"), []).append(n)
             continue
-        home = next((nb for nb in g.neighbors(n) if nb in switch_angle), None)
+        home = next((nb for nb in g.neighbors(n) if nb in switch_set), None)
         if home:
             leaves_by_switch[home].append(n)
         else:
             orphans.append(n)
 
-    wedge = (2 * math.pi / n_switches) * 0.85
-    for sid, leaves in leaves_by_switch.items():
+    members_per_switch = {sid: 0 for sid in switch_ids}
+    for hub_id, members in members_by_hub.items():
+        home = next((nb for nb in g.neighbors(hub_id) if nb in switch_set), None)
+        if home:
+            members_per_switch[home] += len(members)
+
+    # Angular span per switch: a floor (so the inner-ring nodes stay apart
+    # and sparse switches still get a usable wedge) plus a share of the rest
+    # proportional to load (direct leaves + half-weight for hub members,
+    # which only occupy a small arc each).
+    weights = {
+        sid: len(leaves_by_switch[sid]) + 0.5 * members_per_switch[sid]
+        for sid in switch_ids
+    }
+    total_w = sum(weights.values()) or 1.0
+    min_span = min(2 * math.pi * 0.06, 2 * math.pi / n_switches)
+    free = 2 * math.pi - n_switches * min_span
+
+    pos = {}
+    switch_angle = {}
+    switch_span = {}
+    cursor = 0.0
+    for sid in switch_ids:
+        span = min_span + free * weights[sid] / total_w
+        center = cursor + span / 2
+        switch_angle[sid] = center
+        switch_span[sid] = span
+        pos[sid] = (switch_radius * math.cos(center), switch_radius * math.sin(center))
+        cursor += span
+
+    # Spread a switch's leaves by a fixed per-leaf angular step (capped at
+    # its wedge) rather than always filling the whole wedge. This keeps a
+    # switch's devices clustered tightly around it -- closer to each other
+    # than to other switches' devices -- instead of flinging a sparse
+    # switch's few leaves out to the edges of its span.
+    per_leaf_step = 0.09
+    for sid in switch_ids:
         base_angle = switch_angle[sid]
-        ordered = _order_leaves(leaves, g)
+        wedge = switch_span[sid] * 0.85
+        ordered = _order_leaves(leaves_by_switch[sid], g)
         count = len(ordered)
+        fan = min((count - 1) * per_leaf_step, wedge) if count > 1 else 0.0
         for i, leaf in enumerate(ordered):
-            offset = 0.0 if count == 1 else (i / (count - 1) - 0.5) * wedge
+            offset = 0.0 if count == 1 else (i / (count - 1) - 0.5) * fan
             angle = base_angle + offset
             pos[leaf] = (leaf_radius * math.cos(angle), leaf_radius * math.sin(angle))
 
