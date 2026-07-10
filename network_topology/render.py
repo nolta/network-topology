@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import csv
+import math
 from pathlib import Path
 
 import matplotlib
@@ -95,17 +96,43 @@ def write_dot(topo: Topology, path: Path) -> None:
     path.write_text("\n".join(lines) + "\n")
 
 
+def _order_leaves(leaves: list, g: nx.Graph) -> list:
+    """Order a switch's leaf nodes for the wedge fan so hub pseudo-nodes are
+    spread evenly across it rather than clumped together. Node ids sort by
+    kind (all "hub:*" land adjacent), which otherwise stacks the hubs -- and
+    their member fans -- on nearly the same radial, making them look chained."""
+    hubs = sorted(n for n in leaves if g.nodes[n].get("kind") == "hub")
+    others = sorted(n for n in leaves if g.nodes[n].get("kind") != "hub")
+    if not hubs or not others:
+        return hubs + others
+    total = len(others) + len(hubs)
+    ordered = []
+    oi = hi = 0
+    for slot in range(total):
+        # Place a hub once its evenly-spaced target fraction is reached
+        # (a Bresenham-style interleave), otherwise the next plain leaf.
+        if hi < len(hubs) and (hi + 0.5) / len(hubs) <= (slot + 0.5) / total:
+            ordered.append(hubs[hi])
+            hi += 1
+        elif oi < len(others):
+            ordered.append(others[oi])
+            oi += 1
+        else:
+            ordered.append(hubs[hi])
+            hi += 1
+    return ordered
+
+
 def _clustered_layout(g: nx.Graph) -> dict:
     """Switches on an inner ring; each switch's own leaf devices fanned out
-    in a wedge around it on an outer ring (alternating radius to reduce
-    label overlap), instead of one global force layout for every node."""
-    import math
-
+    in a wedge around it on an outer ring, all at a single radius so no two
+    neighbours ever sit on the same ray from the switch (which read as one
+    being 'behind' the other). Labels are rotated radially at draw time to
+    stay legible without needing radius jitter."""
     switch_ids = sorted(n for n, d in g.nodes(data=True) if d.get("kind") == "switch")
     n_switches = max(len(switch_ids), 1)
     switch_radius = 4.0
-    leaf_radius = switch_radius + 2.2
-    leaf_radius_jitter = 1.0
+    leaf_radius = switch_radius + 2.6
 
     pos = {}
     switch_angle = {}
@@ -132,35 +159,36 @@ def _clustered_layout(g: nx.Graph) -> dict:
     wedge = (2 * math.pi / n_switches) * 0.85
     for sid, leaves in leaves_by_switch.items():
         base_angle = switch_angle[sid]
-        count = len(leaves)
-        for i, leaf in enumerate(sorted(leaves)):
+        ordered = _order_leaves(leaves, g)
+        count = len(ordered)
+        for i, leaf in enumerate(ordered):
             offset = 0.0 if count == 1 else (i / (count - 1) - 0.5) * wedge
             angle = base_angle + offset
-            radius = leaf_radius + (leaf_radius_jitter if i % 2 else 0.0)
-            pos[leaf] = (radius * math.cos(angle), radius * math.sin(angle))
+            pos[leaf] = (leaf_radius * math.cos(angle), leaf_radius * math.sin(angle))
 
-    outer_radius = leaf_radius + 2 * leaf_radius_jitter
+    outer_radius = leaf_radius + 2.5
     for i, n in enumerate(sorted(orphans)):
         angle = 2 * math.pi * i / max(len(orphans), 1)
         pos[n] = (outer_radius * math.cos(angle), outer_radius * math.sin(angle))
 
-    # Fan each hub's member devices out just beyond the hub, on the far side
-    # from its switch, so it reads as "one uplink, several devices behind it".
+    # Fan each hub's member devices out just beyond the hub, in a small arc
+    # centered on the hub's own radial (origin-centered, like a mini switch
+    # fan). Placing them on the same radial theme as everything else -- rather
+    # than perpendicular to the skewed switch->hub line -- keeps them orderly
+    # and their rotated labels pointing consistently outward.
+    member_gap = 1.7    # how far members sit beyond their hub
+    member_arc = 0.20   # angular spread of the member fan (radians)
     for hub_id, members in members_by_hub.items():
         if hub_id not in pos:
             continue
         hx, hy = pos[hub_id]
-        home_sw = next((nb for nb in g.neighbors(hub_id) if nb in switch_angle), None)
-        sx, sy = pos[home_sw] if home_sw else (0.0, 0.0)
-        dx, dy = hx - sx, hy - sy
-        norm = math.hypot(dx, dy) or 1.0
-        ux, uy = dx / norm, dy / norm  # outward unit vector (switch -> hub)
-        px, py = -uy, ux               # perpendicular, for spreading the fan
+        hub_angle = math.atan2(hy, hx)
+        member_r = math.hypot(hx, hy) + member_gap
         count = len(members)
-        step, spread = 1.2, 1.5
         for i, m in enumerate(sorted(members)):
             t = 0.0 if count == 1 else (i / (count - 1) - 0.5)
-            pos[m] = (hx + ux * step + px * t * spread, hy + uy * step + py * t * spread)
+            a = hub_angle + t * member_arc
+            pos[m] = (member_r * math.cos(a), member_r * math.sin(a))
 
     return pos
 
@@ -234,15 +262,33 @@ def write_png(topo: Topology, path: Path) -> None:
         if e
     ]
 
+    # Switch labels stay centered on the node (bold). Leaf/member labels are
+    # anchored just outside the node and rotated along the node's radial, so
+    # angularly-close labels splay outward like spokes and don't overlap --
+    # this is what lets us drop the radius jitter that caused the "stacked on
+    # one ray" ambiguity.
     switch_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "switch"}
-    leaf_labels = {
-        n: d["label"] for n, d in g.nodes(data=True)
-        if d.get("kind") not in ("switch", "behind-hub")
-    }
-    member_labels = {n: d["label"] for n, d in g.nodes(data=True) if d.get("kind") == "behind-hub"}
     nx.draw_networkx_labels(g, pos, labels=switch_labels, font_size=10, font_weight="bold")
-    nx.draw_networkx_labels(g, pos, labels=leaf_labels, font_size=7)
-    nx.draw_networkx_labels(g, pos, labels=member_labels, font_size=6)
+
+    for n, d in g.nodes(data=True):
+        kind = d.get("kind")
+        if kind == "switch":
+            continue
+        x, y = pos[n]
+        angle = math.atan2(y, x)
+        r = math.hypot(x, y)
+        deg = math.degrees(angle)
+        if deg > 90 or deg < -90:  # keep text upright on the left half
+            deg += 180
+            ha = "right"
+        else:
+            ha = "left"
+        label_r = r + 0.35
+        plt.text(
+            label_r * math.cos(angle), label_r * math.sin(angle), d["label"],
+            rotation=deg, rotation_mode="anchor", ha=ha, va="center",
+            fontsize=6 if kind == "behind-hub" else 7,
+        )
 
     # Only label the switch-to-switch backbone -- labeling every leaf edge
     # is what made the old layout unreadable; per-host port info is still
