@@ -32,6 +32,16 @@ source .venv/bin/activate
 python -m network_topology --config config.yaml --output output
 ```
 
+Add `-v`/`--verbose` to see every individual SNMP request as it happens --
+target host, table name, parameters, timing, and success/failure for each
+one. Useful for pinpointing exactly where and why a switch's collection is
+failing (which table, how long it took before timing out, etc.) rather than
+just seeing the final summary error:
+
+```
+python -m network_topology --config config.yaml --output output -v
+```
+
 ## How link discovery works
 
 1. **LLDP-MIB** (`lldpRemTable`) is walked on every switch first. This is

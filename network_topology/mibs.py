@@ -44,3 +44,17 @@ PORT_ID_SUBTYPE_INTERFACE_NAME = "5"
 PORT_ID_SUBTYPE_LOCAL = "7"
 
 CHASSIS_ID_SUBTYPE_MAC_ADDRESS = "4"
+
+# Reverse lookup for logging: OID -> friendly constant name (e.g.
+# ".1.3.6.1.2.1.17.4.3.1.3" -> "DOT1D_TP_FDB_STATUS").
+_OID_TO_NAME = {
+    _value: _name
+    for _name, _value in list(globals().items())
+    if _name.isupper() and isinstance(_value, str) and _value.startswith(".")
+}
+
+
+def name_for(oid: str) -> str:
+    """Human-readable name for a known OID, for logging. Falls back to the
+    raw OID if it isn't one of the constants defined in this module."""
+    return _OID_TO_NAME.get(oid, oid)

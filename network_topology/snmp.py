@@ -7,9 +7,15 @@ values ourselves.
 """
 from __future__ import annotations
 
+import logging
 import re
 import subprocess
+import time
 from dataclasses import dataclass
+
+from . import mibs
+
+logger = logging.getLogger(__name__)
 
 _LINE_RE = re.compile(
     r"^(?P<oid>\.\d[\d.]*)\s*=\s*(?:(?P<type>[A-Za-z][\w-]*)\s*:\s*)?(?P<value>.*)$"
@@ -85,19 +91,32 @@ def walk(
         host,
         base_oid,
     ]
+    label = mibs.name_for(base_oid)
+    logger.debug(
+        "walk %s %s (max_repetitions=%d timeout=%ds retries=%d)",
+        host, label, max_repetitions, timeout, retries,
+    )
+    start = time.monotonic()
+
     # Safety net for the whole walk (many GETBULK round-trips over a
     # possibly high-latency link), not just one PDU -- but bounded so a
     # single stuck table can't silently eat minutes.
     try:
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 8 + 10)
     except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - start
+        logger.debug("walk %s %s FAILED after %.2fs: subprocess safety timeout", host, label, elapsed)
         raise SnmpError(f"snmpbulkwalk timed out talking to {host}") from exc
 
+    elapsed = time.monotonic() - start
     if proc.returncode != 0 and not proc.stdout.strip():
+        logger.debug("walk %s %s FAILED after %.2fs: %s", host, label, elapsed, proc.stderr.strip())
         raise SnmpError(f"snmpbulkwalk failed for {host} {base_oid}: {proc.stderr.strip()}")
 
     varbinds = _parse_lines(proc.stdout)
-    return {_index_suffix(vb.oid, base_oid): vb for vb in varbinds}
+    result = {_index_suffix(vb.oid, base_oid): vb for vb in varbinds}
+    logger.debug("walk %s %s OK in %.2fs (%d rows)", host, label, elapsed, len(result))
+    return result
 
 
 def get(
@@ -122,12 +141,23 @@ def get(
         host,
         oid,
     ]
+    label = mibs.name_for(oid)
+    logger.debug("get %s %s (timeout=%ds retries=%d)", host, label, timeout, retries)
+    start = time.monotonic()
+
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 30 + 10)
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 8 + 10)
     except subprocess.TimeoutExpired as exc:
+        elapsed = time.monotonic() - start
+        logger.debug("get %s %s FAILED after %.2fs: subprocess safety timeout", host, label, elapsed)
         raise SnmpError(f"snmpget timed out talking to {host}") from exc
 
+    elapsed = time.monotonic() - start
     varbinds = _parse_lines(proc.stdout)
+    if varbinds:
+        logger.debug("get %s %s OK in %.2fs: %s", host, label, elapsed, varbinds[0].value)
+    else:
+        logger.debug("get %s %s FAILED after %.2fs: no value returned", host, label, elapsed)
     return varbinds[0] if varbinds else None
 
 

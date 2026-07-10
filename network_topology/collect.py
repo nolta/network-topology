@@ -1,11 +1,14 @@
 """Pull everything we need from one switch over SNMP."""
 from __future__ import annotations
 
+import logging
 import time
 from dataclasses import dataclass, field
 
 from . import mibs
 from .snmp import SnmpError, get, hexstring_to_mac, normalize_mac, walk
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -71,11 +74,17 @@ def collect_switch(
     max_repetitions: int = 10,
     pace_seconds: float = 0.0,
 ) -> SwitchData:
+    logger.debug(
+        "collect_switch %s starting (timeout=%ds retries=%d max_repetitions=%d pace_seconds=%.2f)",
+        host, timeout, retries, max_repetitions, pace_seconds,
+    )
+    collect_start = time.monotonic()
     data = SwitchData(ip=host)
 
     def _walk(oid: str):
         result = walk(host, community, oid, version, timeout, retries, max_repetitions)
         if pace_seconds:
+            logger.debug("pacing %.2fs before next request to %s", pace_seconds, host)
             time.sleep(pace_seconds)
         return result
 
@@ -181,4 +190,5 @@ def collect_switch(
         _, ip = _ip_from_arp_index(index_suffix)
         data.arp[hexstring_to_mac(vb.value)] = ip
 
+    logger.debug("collect_switch %s finished in %.2fs", host, time.monotonic() - collect_start)
     return data
