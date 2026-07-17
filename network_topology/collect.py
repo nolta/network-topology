@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import mibs
-from .snmp import SnmpError, get, hexstring_to_mac, normalize_mac, walk
+from .snmp import SnmpError, get, mac_from_octets, walk
 
 logger = logging.getLogger(__name__)
 
@@ -80,32 +80,29 @@ def load_switches(path: Path) -> tuple[list[SwitchData], str]:
 
 
 def _decode_id(subtype: str, vb) -> str:
-    """Decode an LLDP chassis/port ID varbind based on its subtype.
+    """Decode an LLDP chassis/port ID varbind according to its subtype.
 
-    Some vendors (e.g. Planet) encode MAC-address-subtype IDs as literal
-    ASCII text ('A8-F7-E0-89-A0-65') rather than raw MAC bytes, so net-snmp
-    tags them STRING instead of Hex-STRING. normalize_mac() handles both
-    representations and leaves non-MAC values untouched.
+    The subtype is what tells us how to read the bytes, so we branch on it
+    explicitly. as_mac() copes with both a proper 6-byte value and vendors
+    (e.g. Planet) that put the MAC in as ASCII text 'A8-F7-E0-89-A0-65'.
     """
     if vb is None:
         return ""
     if subtype in (mibs.CHASSIS_ID_SUBTYPE_MAC_ADDRESS, mibs.PORT_ID_SUBTYPE_MAC_ADDRESS):
-        return normalize_mac(vb.value)
-    return vb.value
+        return vb.as_mac()
+    return vb.as_text()
 
 
 def _mac_from_fdb_index(index_suffix: str) -> str:
     """dot1dTpFdbTable index = 6 MAC octets."""
-    octets = index_suffix.split(".")
-    return ":".join(f"{int(o):02x}" for o in octets)
+    return mac_from_octets(index_suffix.split("."))
 
 
 def _mac_from_q_fdb_index(index_suffix: str) -> str:
     """dot1qTpFdbTable index = dot1qFdbId(VLAN).<6 MAC octets>. Take the
     trailing 6 octets; the leading VLAN id is a single dotted component
     regardless of its magnitude."""
-    octets = index_suffix.split(".")[-6:]
-    return ":".join(f"{int(o):02x}" for o in octets)
+    return mac_from_octets(index_suffix.split(".")[-6:])
 
 
 def _ip_from_arp_index(index_suffix: str) -> tuple[str, str]:
@@ -136,12 +133,12 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
         seen = set()
         for index_suffix, port_vb in q_fdb_port.items():
             status_vb = q_fdb_status.get(index_suffix)
-            if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
+            if status_vb and status_vb.as_text() != "3":  # 3 = learned/forwarding
                 continue
-            if port_vb.value == "0":
+            if port_vb.as_text() == "0":
                 continue
             mac = _mac_from_q_fdb_index(index_suffix)
-            pair = (mac, port_vb.value)
+            pair = (mac, port_vb.as_text())
             if pair in seen:
                 continue
             seen.add(pair)
@@ -154,12 +151,12 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
     fdb_status = _walk_optional(mibs.DOT1D_TP_FDB_STATUS)
     for index_suffix, port_vb in fdb_port.items():
         status_vb = fdb_status.get(index_suffix)
-        if status_vb and status_vb.value != "3":  # 3 = learned/forwarding
+        if status_vb and status_vb.as_text() != "3":  # 3 = learned/forwarding
             continue
-        if port_vb.value == "0":
+        if port_vb.as_text() == "0":
             continue
         mac = _mac_from_fdb_index(index_suffix)
-        data.fdb.append((mac, port_vb.value))
+        data.fdb.append((mac, port_vb.as_text()))
 
 
 def collect_switch(
@@ -192,33 +189,35 @@ def collect_switch(
             return {}
 
     sys_name_vb = get(host, community, mibs.SYS_NAME, version, timeout, retries)
-    data.sys_name = sys_name_vb.value if sys_name_vb else host
+    data.sys_name = sys_name_vb.as_text() if sys_name_vb else host
     sys_descr_vb = get(host, community, mibs.SYS_DESCR, version, timeout, retries)
-    data.sys_descr = sys_descr_vb.value if sys_descr_vb else ""
+    data.sys_descr = sys_descr_vb.as_text() if sys_descr_vb else ""
 
     loc_chassis_subtype_vb = get(
         host, community, mibs.LLDP_LOC_CHASSIS_ID_SUBTYPE, version, timeout, retries
     )
     loc_chassis_id_vb = get(host, community, mibs.LLDP_LOC_CHASSIS_ID, version, timeout, retries)
     if loc_chassis_subtype_vb and loc_chassis_id_vb:
-        data.chassis_id = _decode_id(loc_chassis_subtype_vb.value, loc_chassis_id_vb)
+        data.chassis_id = _decode_id(loc_chassis_subtype_vb.as_text(), loc_chassis_id_vb)
 
     if_name = _walk(mibs.IF_NAME)
     if_descr = _walk(mibs.IF_DESCR)
     for ifindex, vb in if_descr.items():
-        data.ifindex_to_name[ifindex] = vb.value
+        data.ifindex_to_name[ifindex] = vb.as_text()
     for ifindex, vb in if_name.items():
-        if vb.value:
-            data.ifindex_to_name[ifindex] = vb.value
+        if vb.as_text():
+            data.ifindex_to_name[ifindex] = vb.as_text()
 
     if_phys = _walk(mibs.IF_PHYS_ADDRESS)
     for ifindex, vb in if_phys.items():
-        if vb.type == "Hex-STRING":
-            data.ifindex_to_mac[ifindex] = hexstring_to_mac(vb.value)
+        # Only genuine 6-byte addresses; VLAN/loopback interfaces report an
+        # empty ifPhysAddress.
+        if vb.is_mac_bytes:
+            data.ifindex_to_mac[ifindex] = vb.as_mac()
 
     bridge_port_ifindex = _walk(mibs.DOT1D_BASE_PORT_IF_INDEX)
     for bport, vb in bridge_port_ifindex.items():
-        data.bridge_port_to_ifindex[bport] = vb.value
+        data.bridge_port_to_ifindex[bport] = vb.as_text()
 
     lldp_loc_id_subtype = _walk(mibs.LLDP_LOC_PORT_ID_SUBTYPE)
     lldp_loc_id = _walk(mibs.LLDP_LOC_PORT_ID)
@@ -229,13 +228,13 @@ def collect_switch(
     local_port_nums = set(lldp_loc_id_subtype) | set(lldp_loc_id) | set(lldp_loc_desc)
     for port_num in local_port_nums:
         subtype_vb = lldp_loc_id_subtype.get(port_num)
-        subtype = subtype_vb.value if subtype_vb else ""
+        subtype = subtype_vb.as_text() if subtype_vb else ""
         id_vb = lldp_loc_id.get(port_num)
         desc_vb = lldp_loc_desc.get(port_num)
         data.lldp_local_ports[port_num] = {
             "id_subtype": subtype,
-            "id": _decode_id(subtype, id_vb) if subtype else (id_vb.value if id_vb else ""),
-            "desc": desc_vb.value if desc_vb else "",
+            "id": _decode_id(subtype, id_vb) if subtype else (id_vb.as_text() if id_vb else ""),
+            "desc": desc_vb.as_text() if desc_vb else "",
         }
 
     rem_chassis_subtype = _walk(mibs.LLDP_REM_CHASSIS_ID_SUBTYPE)
@@ -250,18 +249,18 @@ def collect_switch(
         # index_suffix = timeMark.localPortNum.remIndex
         parts = index_suffix.split(".")
         local_port_num = parts[1] if len(parts) >= 2 else index_suffix
-        chassis_subtype = chassis_subtype_vb.value
+        chassis_subtype = chassis_subtype_vb.as_text()
         port_subtype_vb = rem_port_subtype.get(index_suffix)
-        port_subtype = port_subtype_vb.value if port_subtype_vb else ""
+        port_subtype = port_subtype_vb.as_text() if port_subtype_vb else ""
         entry = LldpRemoteEntry(
             local_port_num=local_port_num,
             chassis_id_subtype=chassis_subtype,
             chassis_id=_decode_id(chassis_subtype, rem_chassis_id.get(index_suffix)),
             port_id_subtype=port_subtype,
             port_id=_decode_id(port_subtype, rem_port_id.get(index_suffix)),
-            port_desc=(rem_port_desc[index_suffix].value if index_suffix in rem_port_desc else ""),
-            sys_name=(rem_sys_name[index_suffix].value if index_suffix in rem_sys_name else ""),
-            sys_desc=(rem_sys_desc[index_suffix].value if index_suffix in rem_sys_desc else ""),
+            port_desc=(rem_port_desc[index_suffix].as_text() if index_suffix in rem_port_desc else ""),
+            sys_name=(rem_sys_name[index_suffix].as_text() if index_suffix in rem_sys_name else ""),
+            sys_desc=(rem_sys_desc[index_suffix].as_text() if index_suffix in rem_sys_desc else ""),
         )
         data.lldp_remote.append(entry)
 
@@ -269,10 +268,10 @@ def collect_switch(
 
     arp = _walk(mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS)
     for index_suffix, vb in arp.items():
-        if vb.type != "Hex-STRING":
+        if not vb.is_mac_bytes:
             continue
         _, ip = _ip_from_arp_index(index_suffix)
-        data.arp[hexstring_to_mac(vb.value)] = ip
+        data.arp[vb.as_mac()] = ip
 
     logger.debug("collect_switch %s finished in %.2fs", host, time.monotonic() - collect_start)
     return data
