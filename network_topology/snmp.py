@@ -1,49 +1,30 @@
-"""SNMP access, currently backed by the net-snmp CLI tools.
+"""SNMP access via a small built-in SNMPv2c engine (see _snmpv2c.py).
 
 The whole module exists to hand the rest of the code *decoded, typed*
 varbinds -- an OID, an explicit SnmpType, and (for OCTET STRINGs) the true
 raw bytes. Callers ask for what they want via as_text()/as_mac() rather
-than pattern-matching on how some backend chose to print a value. That
-keeps the backend swappable (a pure-Python SNMP library would populate the
-same structure natively) and, more importantly, keeps *interpretation*
-decisions in our code where we can see them.
+than inspecting how some backend chose to print a value. That keeps
+*interpretation* decisions in our code where we can see them -- which is
+exactly what a print-based backend hid (a Planet quirk: LLDP chassis IDs
+sent as ASCII "A8-F7-..." text rather than 6 raw bytes).
 
-Why we shell out to net-snmp: it's already installed, well-tested, and
-handles the wire protocol. But its text output is lossy by default -- it
-applies DISPLAY-HINTs from whatever MIBs happen to be installed on the
-host and guesses whether an OCTET STRING is "printable". We defeat both:
-
-  -m ""  load no MIBs, so no DISPLAY-HINT ever reformats a value and the
-         output can't vary with the host's MIB set
-  -On    numeric OIDs
-  -Ox    print every OCTET STRING as hex, so we always recover raw bytes
-  -Oe    numeric enums, never symbolic labels
-
-Without this, a value's printed form depends on the host's MIB
-installation and on net-snmp's printability heuristic -- which is exactly
-what hid a Planet quirk (LLDP chassis IDs sent as ASCII "A8-F7-..." text
-rather than 6 raw bytes) behind a STRING/Hex-STRING distinction.
+We speak SNMPv2c ourselves over UDP (_snmpv2c) rather than shelling out to
+the net-snmp CLI tools, so the tool has no external runtime dependency and
+works on hosts that don't have net-snmp installed. v2c has no crypto, so
+the engine is small.
 """
 from __future__ import annotations
 
 import enum
 import logging
 import re
-import subprocess
 import time
 from dataclasses import dataclass
 
-from . import mibs
+from . import _snmpv2c, mibs
 
 logger = logging.getLogger(__name__)
 
-# Flags that make net-snmp's output deterministic and machine-readable.
-# See the module docstring for why each one matters.
-_OUTPUT_ARGS = ["-m", "", "-Onxe"]
-
-_VARBIND_RE = re.compile(
-    r"^(?P<oid>\.\d[\d.]*)\s*=\s*(?:(?P<type>[A-Za-z][\w-]*)\s*:\s*)?(?P<value>.*)$"
-)
 _NOT_HEX_RE = re.compile(r"[^0-9A-Fa-f]")
 
 
@@ -61,24 +42,6 @@ class SnmpType(enum.Enum):
     OID = "oid"
     NULL = "null"
     UNKNOWN = "unknown"
-
-
-# net-snmp's printed type token -> our type.
-_TYPE_TOKENS = {
-    "Hex-STRING": SnmpType.OCTET_STRING,
-    "STRING": SnmpType.OCTET_STRING,
-    "OCTET": SnmpType.OCTET_STRING,
-    "INTEGER": SnmpType.INTEGER,
-    "Counter32": SnmpType.COUNTER,
-    "Counter64": SnmpType.COUNTER,
-    "Gauge32": SnmpType.GAUGE,
-    "UInteger32": SnmpType.GAUGE,
-    "Timeticks": SnmpType.TIMETICKS,
-    "IpAddress": SnmpType.IP_ADDRESS,
-    "OID": SnmpType.OID,
-    "Null": SnmpType.NULL,
-}
-_NUMERIC_TYPES = {SnmpType.INTEGER, SnmpType.COUNTER, SnmpType.GAUGE, SnmpType.TIMETICKS}
 
 
 def _mac_from_hex_text(text: str) -> str | None:
@@ -127,6 +90,31 @@ class SnmpVarBind:
         return _mac_from_hex_text(text) or text
 
 
+# BER value tag -> our SnmpType.
+_TAG_TO_TYPE = {
+    _snmpv2c.TAG_OCTET_STRING: SnmpType.OCTET_STRING,
+    _snmpv2c.TAG_OPAQUE: SnmpType.OCTET_STRING,
+    _snmpv2c.TAG_INTEGER: SnmpType.INTEGER,
+    _snmpv2c.TAG_COUNTER32: SnmpType.COUNTER,
+    _snmpv2c.TAG_COUNTER64: SnmpType.COUNTER,
+    _snmpv2c.TAG_GAUGE32: SnmpType.GAUGE,
+    _snmpv2c.TAG_TIMETICKS: SnmpType.TIMETICKS,
+    _snmpv2c.TAG_IPADDRESS: SnmpType.IP_ADDRESS,
+    _snmpv2c.TAG_OID: SnmpType.OID,
+}
+
+
+def _varbind_from_raw(oid: str, tag: int, value) -> SnmpVarBind:
+    kind = _TAG_TO_TYPE.get(tag, SnmpType.UNKNOWN)
+    if kind is SnmpType.OCTET_STRING:
+        return SnmpVarBind(oid, kind, raw=value if isinstance(value, bytes) else b"")
+    if kind in (SnmpType.INTEGER, SnmpType.COUNTER, SnmpType.GAUGE, SnmpType.TIMETICKS):
+        return SnmpVarBind(oid, kind, number=value if isinstance(value, int) else None)
+    if kind in (SnmpType.IP_ADDRESS, SnmpType.OID):
+        return SnmpVarBind(oid, kind, text_value=value or "")
+    return SnmpVarBind(oid, SnmpType.UNKNOWN)
+
+
 def _index_suffix(oid: str, base_oid: str) -> str:
     """Return the index portion of oid after base_oid, e.g. '1.2.3'."""
     base = base_oid if base_oid.startswith(".") else "." + base_oid
@@ -135,73 +123,8 @@ def _index_suffix(oid: str, base_oid: str) -> str:
     return oid[len(base) + 1 :]
 
 
-def _build_varbind(oid: str, token: str, value_text: str) -> SnmpVarBind:
-    kind = _TYPE_TOKENS.get(token, SnmpType.UNKNOWN)
-    # net-snmp renders a zero-length OCTET STRING as a bare `= ""` with no
-    # type token at all (seen on lldpRemSysName for a neighbour that sends
-    # no system name). Treat a typeless quoted value as the empty string it
-    # is -- otherwise it decodes to a literal '""', which is truthy and
-    # silently wins over a legitimate fallback.
-    if (
-        kind is SnmpType.UNKNOWN
-        and len(value_text) >= 2
-        and value_text.startswith('"')
-        and value_text.endswith('"')
-    ):
-        kind, token = SnmpType.OCTET_STRING, "STRING"
-    if kind is SnmpType.OCTET_STRING:
-        if token == "Hex-STRING":
-            try:
-                raw = bytes(int(b, 16) for b in value_text.split())
-            except ValueError:
-                raw = b""
-        else:  # plain STRING (shouldn't happen under -Ox, handled defensively)
-            text = value_text
-            if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
-                text = text[1:-1]
-            raw = text.encode("utf-8", errors="replace")
-        return SnmpVarBind(oid=oid, type=kind, raw=raw)
-    if kind in _NUMERIC_TYPES:
-        m = re.search(r"-?\d+", value_text)
-        return SnmpVarBind(
-            oid=oid, type=kind,
-            number=int(m.group()) if m else None,
-            text_value=value_text,
-        )
-    return SnmpVarBind(oid=oid, type=kind, text_value=value_text)
-
-
-def _parse_lines(output: str) -> list[SnmpVarBind]:
-    """Parse net-snmp output into varbinds. Long Hex-STRING values wrap
-    across lines (16 bytes per line), so lines that aren't a new
-    'OID = TYPE: value' are continuations of the previous varbind."""
-    results: list[SnmpVarBind] = []
-    oid = token = None
-    parts: list[str] = []
-
-    def flush():
-        if oid is not None:
-            results.append(_build_varbind(oid, token or "", " ".join(parts).strip()))
-
-    for line in output.splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        if stripped.startswith("Timeout:") or "No Such" in stripped:
-            flush()
-            oid = token = None
-            parts = []
-            continue
-        m = _VARBIND_RE.match(stripped)
-        if m:
-            flush()
-            oid = m.group("oid")
-            token = m.group("type") or ""
-            parts = [m.group("value").strip()]
-        elif oid is not None:
-            parts.append(stripped)  # continuation of a wrapped Hex-STRING
-    flush()
-    return results
+def _under(oid: str, base: str) -> bool:
+    return oid == base or oid.startswith(base + ".")
 
 
 def walk(
@@ -213,51 +136,51 @@ def walk(
     retries: int = 1,
     max_repetitions: int = 10,
 ) -> dict[str, SnmpVarBind]:
-    """Walk base_oid on host, return {index_suffix: SnmpVarBind}.
+    """Walk base_oid on host via repeated GETBULK, return {index_suffix: vb}.
 
-    max_repetitions controls GETBULK's row count per PDU (-Cr). Weak
-    embedded agents can choke assembling large bulk responses; lowering
-    this trades more round-trips for a better chance each one succeeds.
+    max_repetitions is GETBULK's rows-per-response. Weak embedded agents can
+    choke assembling large bulk responses; lowering it trades more
+    round-trips for a better chance each one succeeds.
     """
-    cmd = [
-        "snmpbulkwalk",
-        "-v",
-        version,
-        "-c",
-        community,
-        *_OUTPUT_ARGS,
-        "-t",
-        str(timeout),
-        "-r",
-        str(retries),
-        f"-Cr{max_repetitions}",
-        host,
-        base_oid,
-    ]
     label = mibs.name_for(base_oid)
     logger.debug(
-        "walk %s %s (max_repetitions=%d timeout=%ds retries=%d)",
+        "walk %s %s (max_repetitions=%d timeout=%ss retries=%d)",
         host, label, max_repetitions, timeout, retries,
     )
     start = time.monotonic()
+    # Overall safety bound so a stuck table can't loop forever over many
+    # GETBULK round-trips (matches the old subprocess-timeout budget).
+    budget = timeout * (retries + 1) * 8 + 10
+    base = base_oid if base_oid.startswith(".") else "." + base_oid
+    result: dict[str, SnmpVarBind] = {}
+    current = base_oid
 
-    # Safety net for the whole walk (many GETBULK round-trips over a
-    # possibly high-latency link), not just one PDU -- but bounded so a
-    # single stuck table can't silently eat minutes.
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 8 + 10)
-    except subprocess.TimeoutExpired as exc:
-        elapsed = time.monotonic() - start
-        logger.debug("walk %s %s FAILED after %.2fs: subprocess safety timeout", host, label, elapsed)
-        raise SnmpError(f"snmpbulkwalk timed out talking to {host}") from exc
+    while True:
+        if time.monotonic() - start > budget:
+            raise SnmpError(f"snmp walk timed out talking to {host} {base_oid}")
+        try:
+            error_status, vbs = _snmpv2c.getbulk(
+                host, community, current, 0, max_repetitions, timeout, retries
+            )
+        except (TimeoutError, OSError) as exc:
+            elapsed = time.monotonic() - start
+            logger.debug("walk %s %s FAILED after %.2fs: %s", host, label, elapsed, exc)
+            raise SnmpError(f"snmp walk failed for {host} {base_oid}: {exc}") from exc
+
+        if error_status or not vbs:
+            break
+        prev = current
+        done = False
+        for r_oid, tag, value in vbs:
+            if tag in _snmpv2c.EXCEPTION_TAGS or not _under(r_oid, base):
+                done = True  # left the subtree or hit end-of-MIB
+                break
+            result[_index_suffix(r_oid, base_oid)] = _varbind_from_raw(r_oid, tag, value)
+            current = r_oid
+        if done or current == prev:  # done, or the agent failed to advance
+            break
 
     elapsed = time.monotonic() - start
-    if proc.returncode != 0 and not proc.stdout.strip():
-        logger.debug("walk %s %s FAILED after %.2fs: %s", host, label, elapsed, proc.stderr.strip())
-        raise SnmpError(f"snmpbulkwalk failed for {host} {base_oid}: {proc.stderr.strip()}")
-
-    varbinds = _parse_lines(proc.stdout)
-    result = {_index_suffix(vb.oid, base_oid): vb for vb in varbinds}
     logger.debug("walk %s %s OK in %.2fs (%d rows)", host, label, elapsed, len(result))
     return result
 
@@ -270,38 +193,29 @@ def get(
     timeout: int = 3,
     retries: int = 1,
 ) -> SnmpVarBind | None:
-    cmd = [
-        "snmpget",
-        "-v",
-        version,
-        "-c",
-        community,
-        *_OUTPUT_ARGS,
-        "-t",
-        str(timeout),
-        "-r",
-        str(retries),
-        host,
-        oid,
-    ]
+    """SNMP GET one OID. Returns None if the object doesn't exist or the
+    request fails at the protocol level (a transport failure raises)."""
     label = mibs.name_for(oid)
-    logger.debug("get %s %s (timeout=%ds retries=%d)", host, label, timeout, retries)
+    logger.debug("get %s %s (timeout=%ss retries=%d)", host, label, timeout, retries)
     start = time.monotonic()
-
     try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout * (retries + 1) * 8 + 10)
-    except subprocess.TimeoutExpired as exc:
+        error_status, vbs = _snmpv2c.get(host, community, [oid], timeout, retries)
+    except (TimeoutError, OSError) as exc:
         elapsed = time.monotonic() - start
-        logger.debug("get %s %s FAILED after %.2fs: subprocess safety timeout", host, label, elapsed)
-        raise SnmpError(f"snmpget timed out talking to {host}") from exc
+        logger.debug("get %s %s FAILED after %.2fs: %s", host, label, elapsed, exc)
+        raise SnmpError(f"snmp get failed for {host} {oid}: {exc}") from exc
 
     elapsed = time.monotonic() - start
-    varbinds = _parse_lines(proc.stdout)
-    if varbinds:
-        logger.debug("get %s %s OK in %.2fs: %s", host, label, elapsed, varbinds[0].as_text())
-    else:
-        logger.debug("get %s %s FAILED after %.2fs: no value returned", host, label, elapsed)
-    return varbinds[0] if varbinds else None
+    if error_status or not vbs:
+        logger.debug("get %s %s: no value (error-status=%s)", host, label, error_status)
+        return None
+    r_oid, tag, value = vbs[0]
+    if tag in _snmpv2c.EXCEPTION_TAGS or tag == _snmpv2c.TAG_NULL:
+        logger.debug("get %s %s: no such object/instance", host, label)
+        return None
+    vb = _varbind_from_raw(r_oid, tag, value)
+    logger.debug("get %s %s OK in %.2fs: %s", host, label, elapsed, vb.as_text())
+    return vb
 
 
 def mac_from_octets(octets: list[str]) -> str:

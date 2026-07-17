@@ -127,9 +127,9 @@ def main() -> int:
         switch_ips = config["switches"]
 
         # Each switch is collected independently and is I/O-bound (blocking on
-        # net-snmp subprocesses, which release the GIL), so a thread pool
-        # collects them concurrently. Results are gathered by IP and re-ordered
-        # to match config order so output stays deterministic run-to-run.
+        # UDP socket recv, which releases the GIL), so a thread pool collects
+        # them concurrently. Results are gathered by IP and re-ordered to
+        # match config order so output stays deterministic run-to-run.
         workers = max(1, min(max_concurrency, len(switch_ips)))
         logger.debug("collecting %d switches with up to %d concurrent workers", len(switch_ips), workers)
         args_for = lambda ip: (

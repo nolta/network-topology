@@ -108,8 +108,11 @@ config file.
 
 ## Notes
 
-- Requires `snmpbulkwalk`/`snmpget` from net-snmp on your PATH.
-- All OIDs used are numeric, so no MIB files need to be installed.
+- **No external SNMP tools required.** SNMPv2c is spoken directly over UDP
+  by a small built-in engine (`network_topology/_snmpv2c.py`, pure Python,
+  no dependencies) -- net-snmp does **not** need to be installed. Only
+  SNMPv2c is supported (no v1, no v3).
+- All OIDs used are numeric, so no MIB files are involved either.
 - **Why Q-BRIDGE instead of the classic BRIDGE-MIB FDB:** the legacy
   `dot1dTpFdbTable` is indexed by MAC address only. A VLAN-aware switch
   has to synthesize it in software from its per-VLAN hardware FDB and
