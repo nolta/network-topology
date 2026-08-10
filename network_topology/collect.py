@@ -126,8 +126,16 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
     The Q-BRIDGE table has a VLAN dimension, so a MAC learned on a trunk
     can appear once per VLAN; we dedupe identical (mac, port) pairs so a
     port's learned-MAC count isn't inflated by that.
+
+    NOTE the deliberate use of _walk (not _walk_optional) for the Q-BRIDGE
+    table: a *transport failure* must propagate so the switch-level retry
+    handles it. If we swallowed it we'd read a timeout as "Q-BRIDGE
+    unsupported" and fall through to the legacy walk -- pegging a switch
+    that was merely busy, which is a feedback loop (busy switch -> timeout
+    -> CPU-pegging walk -> busier switch). Only a walk that *succeeds* and
+    returns no rows means the agent genuinely lacks Q-BRIDGE.
     """
-    q_fdb_port = _walk_optional(mibs.DOT1Q_TP_FDB_PORT)
+    q_fdb_port = _walk(mibs.DOT1Q_TP_FDB_PORT)
     if q_fdb_port:
         q_fdb_status = _walk_optional(mibs.DOT1Q_TP_FDB_STATUS)
         seen = set()
@@ -145,8 +153,13 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
             data.fdb.append(pair)
         return
 
-    # Fallback: legacy BRIDGE-MIB (may be slow/CPU-heavy on some switches).
-    logger.debug("%s: Q-BRIDGE FDB empty, falling back to legacy dot1dTpFdbTable", host)
+    # Only reached when the agent answered but has no Q-BRIDGE table.
+    # This legacy walk is CPU-heavy on some agents (see docstring), so warn
+    # rather than debug -- it should be rare and is worth noticing.
+    logger.warning(
+        "%s: no Q-BRIDGE FDB; falling back to legacy dot1dTpFdbTable "
+        "(CPU-heavy on some switches)", host,
+    )
     fdb_port = _walk(mibs.DOT1D_TP_FDB_PORT)
     fdb_status = _walk_optional(mibs.DOT1D_TP_FDB_STATUS)
     for index_suffix, port_vb in fdb_port.items():
