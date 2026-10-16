@@ -14,8 +14,11 @@ from .snmp import SnmpError, get, mac_from_octets, walk
 logger = logging.getLogger(__name__)
 
 # Bump when the SwitchData/LldpRemoteEntry shape changes so stale caches
-# are rejected rather than silently mis-loaded.
-_CACHE_VERSION = 1
+# are rejected rather than silently mis-loaded. Versions in
+# _COMPATIBLE_CACHE_VERSIONS only *added* fields with defaults, so they
+# still load (the new fields come back empty).
+_CACHE_VERSION = 2
+_COMPATIBLE_CACHE_VERSIONS = {1, 2}
 
 
 @dataclass
@@ -43,21 +46,44 @@ class SwitchData:
     lldp_remote: list = field(default_factory=list)  # list[LldpRemoteEntry]
     fdb: list = field(default_factory=list)  # list[(mac, bridge_port)]
     arp: dict = field(default_factory=dict)  # mac -> ip
+    sys_uptime: int | None = None  # TimeTicks (1/100 s) at collection time
+    # ifIndex -> PORT_STAT_FIELDS values, for bridge ports only. Counters
+    # are cumulative since the switch booted; health.py diffs two
+    # collections to see what's *increasing*.
+    port_stats: dict = field(default_factory=dict)
 
 
-def save_switches(switches: list[SwitchData], path: Path) -> None:
+# Per-port fields collected into SwitchData.port_stats, and the OID each
+# comes from. Values are ints (None if the agent lacks that column),
+# except "media" which is a MAU type name like "1000BASE-X".
+PORT_STAT_OIDS = {
+    "oper_status": mibs.IF_OPER_STATUS,
+    "last_change": mibs.IF_LAST_CHANGE,
+    "speed_mbps": mibs.IF_HIGH_SPEED,
+    "in_errors": mibs.IF_IN_ERRORS,
+    "out_errors": mibs.IF_OUT_ERRORS,
+    "fcs_errors": mibs.DOT3_STATS_FCS_ERRORS,
+    "symbol_errors": mibs.DOT3_STATS_SYMBOL_ERRORS,
+    "alignment_errors": mibs.DOT3_STATS_ALIGNMENT_ERRORS,
+}
+
+
+def save_switches(switches: list[SwitchData], path: Path) -> datetime:
     """Persist raw collected data to JSON so diagrams can be regenerated
     without re-running the (slow) SNMP collection. Caching the raw
     SwitchData -- not the derived topology -- means a re-plot also picks up
-    any later changes to the model/merge or rendering logic."""
+    any later changes to the model/merge or rendering logic. Returns the
+    collected_at timestamp it recorded."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+    collected_at = datetime.now(timezone.utc).replace(microsecond=0)
     payload = {
         "version": _CACHE_VERSION,
-        "collected_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "collected_at": collected_at.isoformat(),
         "switches": [asdict(sw) for sw in switches],
     }
     path.write_text(json.dumps(payload, indent=2))
+    return collected_at
 
 
 def load_switches(path: Path) -> tuple[list[SwitchData], str]:
@@ -65,7 +91,7 @@ def load_switches(path: Path) -> tuple[list[SwitchData], str]:
     collected_at). Raises ValueError on an unknown cache version."""
     payload = json.loads(Path(path).read_text())
     version = payload.get("version")
-    if version != _CACHE_VERSION:
+    if version not in _COMPATIBLE_CACHE_VERSIONS:
         raise ValueError(
             f"cache {path} has version {version!r}, this build expects {_CACHE_VERSION}; "
             "re-run a full collection to refresh it"
@@ -170,6 +196,33 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
             continue
         mac = _mac_from_fdb_index(index_suffix)
         data.fdb.append((mac, port_vb.as_text()))
+
+
+def _collect_port_stats(data, _walk, _walk_optional) -> None:
+    """Populate data.port_stats for every bridge port (physical ports, not
+    VLAN interfaces). IF-MIB columns are required; EtherLike and MAU are
+    optional since not every agent implements them."""
+    ifindexes = set(data.bridge_port_to_ifindex.values())
+    tables = {}
+    for name, oid in PORT_STAT_OIDS.items():
+        required = oid in (mibs.IF_OPER_STATUS, mibs.IF_LAST_CHANGE, mibs.IF_IN_ERRORS)
+        tables[name] = (_walk if required else _walk_optional)(oid)
+    # ifMauType is indexed ifIndex.mauIndex; take the first MAU per port.
+    media = {}
+    for index_suffix, vb in _walk_optional(mibs.IF_MAU_TYPE).items():
+        ifindex = index_suffix.split(".")[0]
+        if ifindex in media:
+            continue
+        arc = vb.as_text().rsplit(".", 1)[-1]
+        if vb.as_text().startswith(".1.3.6.1.2.1.26.4."):
+            media[ifindex] = mibs.MAU_TYPE_NAMES.get(arc, f"mau-{arc}")
+    for ifindex in ifindexes:
+        stats = {}
+        for name, table in tables.items():
+            vb = table.get(ifindex)
+            stats[name] = vb.number if vb is not None else None
+        stats["media"] = media.get(ifindex, "")
+        data.port_stats[ifindex] = stats
 
 
 def collect_switch(
@@ -278,6 +331,11 @@ def collect_switch(
         data.lldp_remote.append(entry)
 
     _collect_fdb(host, data, _walk, _walk_optional)
+    # Read uptime right before the port stats so ifLastChange (also in
+    # uptime ticks) can be turned into a wall-clock time accurately.
+    sys_uptime_vb = get(host, community, mibs.SYS_UPTIME, version, timeout, retries)
+    data.sys_uptime = sys_uptime_vb.number if sys_uptime_vb else None
+    _collect_port_stats(data, _walk, _walk_optional)
 
     arp = _walk(mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS)
     for index_suffix, vb in arp.items():

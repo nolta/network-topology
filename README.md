@@ -11,6 +11,8 @@ Outputs:
   Graphviz installed, or paste into an online renderer)
 - `output/topology.png` — a diagram rendered directly with networkx/matplotlib
   (no Graphviz binary required)
+- `output/port_health.csv` — per-port error counters and link state, with
+  what changed since the previous run (see [Port health](#port-health))
 
 ## Setup
 
@@ -68,6 +70,39 @@ cached -- not the finished diagram -- a re-plot also picks up any code
 changes to the topology model or renderer. The log line reports when the
 cached data was collected, so you know how stale it is. `--replot` needs no
 config file.
+
+## Port health
+
+Every collection also reads each physical port's error counters
+(`ifInErrors`/`ifOutErrors`, plus EtherLike FCS, symbol and alignment
+errors), its link state and last link change, and its media type (MAU-MIB,
+e.g. `1000BASE-T` vs fiber `1000BASE-X`). The counters are cumulative since
+the switch booted, so on its own a snapshot only says "N errors, ever". What
+matters on a marginal link is whether errors are *still increasing*, so each
+run is compared against the previous run's `collected.json`. A port is
+flagged when, since that run:
+
+- any error counter increased,
+- its link went down, or
+- its link went down and came back (link changed).
+
+Flagged ports are printed at the end of the run (with `[fiber]` and the
+peer on the other end, when known), and every active port is written to
+`port_health.csv` with both totals (`total_*`) and new-since-last-run
+(`new_*`) counts. A switch reboot between runs is detected from
+`sysUpTime`: counters then restart from zero, so everything counted since is
+treated as new, and links coming up right after the boot aren't flagged.
+The first run (or the first after upgrading from a cache without port
+stats) has nothing to compare against, so it just records a baseline and
+mentions links that came up in the last 24 hours. `--replot` doesn't touch
+`port_health.csv`.
+
+To use it as a monitor, run the collection periodically (e.g. from cron);
+each run reports what changed since the one before. Optical diagnostics
+(SFP receive power, laser bias, temperature) aren't available: these
+switches don't expose them over SNMP (no ENTITY-SENSOR-MIB rows, nothing in
+the vendor MIBs), so a fiber link with too much attenuation only shows up
+here once it starts corrupting frames or dropping link.
 
 ## How link discovery works
 

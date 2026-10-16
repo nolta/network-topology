@@ -6,10 +6,12 @@ import json
 import logging
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 import yaml
 
+from . import health
 from .collect import SwitchData, collect_switch, load_switches, save_switches
 from .model import build_topology
 from .render import render_all
@@ -87,6 +89,7 @@ def main() -> int:
     pkg_logger.addHandler(handler)
 
     cache_path = args.output / "collected.json"
+    port_health = None  # (switches, collected_at, previous, previous_at) when collecting
 
     if args.replot:
         # Rebuild diagram/CSVs from previously collected data -- no network,
@@ -147,20 +150,54 @@ def main() -> int:
             logger.error("No switches responded, nothing to build.")
             return 1
 
-        save_switches(switches, cache_path)
+        # The previous run's cache is the baseline for the port-health
+        # check: counters are cumulative, so only the difference between
+        # two runs shows what's still increasing. Read it before it's
+        # overwritten below.
+        previous, previous_at = _load_previous(cache_path)
+
+        collected_at = save_switches(switches, cache_path)
         logger.debug("cached raw collected data to %s", cache_path)
+        port_health = (switches, collected_at, previous, previous_at)
 
     topo = build_topology(switches)
     render_all(topo, args.output)
 
-    logger.info(
-        "\nDone. %d devices, %d links.\n"
-        "  %s\n  %s\n  %s\n  %s",
-        len(topo.devices), len(topo.links),
+    outputs = [
         args.output / "devices.csv", args.output / "links.csv",
         args.output / "topology.dot", args.output / "topology.png",
+    ]
+    # Skipped on --replot: there's no new snapshot to compare, and
+    # rewriting port_health.csv from the cache would lose its deltas.
+    if port_health is not None:
+        current, collected_at, previous, previous_at = port_health
+        results = health.check_ports(current, collected_at, previous, previous_at, topo)
+        health.write_port_health_csv(results, args.output / "port_health.csv")
+        outputs.append(args.output / "port_health.csv")
+        health.log_summary(results, collected_at, previous_at)
+
+    logger.info(
+        "\nDone. %d devices, %d links.\n%s",
+        len(topo.devices), len(topo.links), "\n".join(f"  {p}" for p in outputs),
     )
     return 0
+
+
+def _load_previous(cache_path: Path) -> tuple[list[SwitchData] | None, datetime | None]:
+    """The previous run's switches and collection time, or (None, None)
+    if there's no usable baseline (no cache, unreadable, or from a build
+    that didn't collect port stats)."""
+    if not cache_path.exists():
+        return None, None
+    try:
+        previous, previous_at = load_switches(cache_path)
+        previous_at = datetime.fromisoformat(previous_at)
+    except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        logger.debug("no port-health baseline: can't load %s: %s", cache_path, exc)
+        return None, None
+    if not any(sw.port_stats for sw in previous):
+        return None, None
+    return previous, previous_at
 
 
 if __name__ == "__main__":

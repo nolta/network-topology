@@ -8,11 +8,28 @@ RFC-compliant) switches will answer these without any vendor MIB needed.
 # SNMPv2-MIB
 SYS_NAME = ".1.3.6.1.2.1.1.5.0"
 SYS_DESCR = ".1.3.6.1.2.1.1.1.0"
+SYS_UPTIME = ".1.3.6.1.2.1.1.3.0"  # TimeTicks (1/100 s) since the agent started
 
 # IF-MIB
 IF_DESCR = ".1.3.6.1.2.1.2.2.1.2"  # ifIndex -> ifDescr
 IF_PHYS_ADDRESS = ".1.3.6.1.2.1.2.2.1.6"  # ifIndex -> MAC
 IF_NAME = ".1.3.6.1.2.1.31.1.1.1.1"  # ifIndex -> ifName (ifXTable, usually short/human like "Gi0/1")
+IF_OPER_STATUS = ".1.3.6.1.2.1.2.2.1.8"  # ifIndex -> 1 up, 2 down, ...
+IF_LAST_CHANGE = ".1.3.6.1.2.1.2.2.1.9"  # ifIndex -> sysUpTime (ticks) at last oper status change
+IF_IN_ERRORS = ".1.3.6.1.2.1.2.2.1.14"  # ifIndex -> Counter32
+IF_OUT_ERRORS = ".1.3.6.1.2.1.2.2.1.20"  # ifIndex -> Counter32
+IF_HIGH_SPEED = ".1.3.6.1.2.1.31.1.1.1.15"  # ifIndex -> Mb/s
+
+# EtherLike-MIB dot3StatsTable (indexed by ifIndex). These are the
+# physical-layer error counters that rise first on a marginal link.
+DOT3_STATS_ALIGNMENT_ERRORS = ".1.3.6.1.2.1.10.7.2.1.2"
+DOT3_STATS_FCS_ERRORS = ".1.3.6.1.2.1.10.7.2.1.3"
+DOT3_STATS_SYMBOL_ERRORS = ".1.3.6.1.2.1.10.7.2.1.18"
+
+# MAU-MIB ifMauType (index ifIndex.mauIndex) -> OID under dot3MauType
+# (.1.3.6.1.2.1.26.4.<n>); tells copper from fiber. Planet reports
+# "0.0" for ports with no link.
+IF_MAU_TYPE = ".1.3.6.1.2.1.26.2.1.1.3"
 
 # BRIDGE-MIB
 DOT1D_BASE_PORT_IF_INDEX = ".1.3.6.1.2.1.17.1.4.1.2"  # bridge port -> ifIndex
@@ -57,6 +74,19 @@ PORT_ID_SUBTYPE_INTERFACE_NAME = "5"
 PORT_ID_SUBTYPE_LOCAL = "7"
 
 CHASSIS_ID_SUBTYPE_MAC_ADDRESS = "4"
+
+# dot3MauType arc numbers (RFC 4836) -> short media name. Only the ones
+# plausible on these switches; anything else is shown as "mau-<n>".
+MAU_TYPE_NAMES = {
+    "15": "100BASE-TX-HD", "16": "100BASE-TX", "17": "100BASE-FX-HD", "18": "100BASE-FX",
+    "21": "1000BASE-X-HD", "22": "1000BASE-X", "23": "1000BASE-LX-HD", "24": "1000BASE-LX",
+    "25": "1000BASE-SX-HD", "26": "1000BASE-SX", "29": "1000BASE-T-HD", "30": "1000BASE-T",
+    "31": "10GBASE-X", "33": "10GBASE-R", "34": "10GBASE-ER", "35": "10GBASE-LR",
+    "36": "10GBASE-SR",
+}
+# Of those, the ones that mean an optical (or at least non-twisted-pair)
+# SFP is in use.
+MAU_FIBER_TYPES = {"17", "18", "21", "22", "23", "24", "25", "26", "31", "33", "34", "35", "36"}
 
 # Reverse lookup for logging: OID -> friendly constant name (e.g.
 # ".1.3.6.1.2.1.17.4.3.1.3" -> "DOT1D_TP_FDB_STATUS").
