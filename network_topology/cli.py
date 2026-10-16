@@ -21,7 +21,8 @@ logger = logging.getLogger(__name__)
 
 
 def _collect_with_retry(
-    ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
+    ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries,
+    web_credentials=None,
 ) -> SwitchData | None:
     """Collect one switch, retrying the whole collection up to
     switch_retries times. Returns None (and logs a warning) if it never
@@ -32,7 +33,8 @@ def _collect_with_retry(
     for attempt in range(1, switch_retries + 1):
         try:
             data = collect_switch(
-                ip, community, version, timeout, retries, max_repetitions, pace_seconds
+                ip, community, version, timeout, retries, max_repetitions, pace_seconds,
+                web_credentials,
             )
             logger.info(
                 "  -> %s (%s): %d LLDP neighbors, %d FDB entries",
@@ -89,7 +91,7 @@ def main() -> int:
     pkg_logger.addHandler(handler)
 
     cache_path = args.output / "collected.json"
-    port_health = None  # (switches, collected_at, previous, previous_at) when collecting
+    port_health = None  # (switches, collected_at, previous, previous_at, thresholds) when collecting
 
     if args.replot:
         # Rebuild diagram/CSVs from previously collected data -- no network,
@@ -118,7 +120,20 @@ def main() -> int:
             )
             return 1
 
-        config = yaml.safe_load(args.config.read_text())
+        try:
+            config = yaml.safe_load(args.config.read_text())
+        except yaml.YAMLError as exc:
+            # Report only the position: YAML's own message quotes the
+            # offending line, which may be a password.
+            # context_mark, when present, is where the broken construct
+            # started (e.g. an unclosed quote), which is the useful place.
+            mark = getattr(exc, "context_mark", None) or getattr(exc, "problem_mark", None)
+            where = f" at line {mark.line + 1}, column {mark.column + 1}" if mark else ""
+            problem = " ".join(
+                p for p in (getattr(exc, "context", None), getattr(exc, "problem", None)) if p
+            ) or "syntax error"
+            logger.error("Config file %s is not valid YAML%s: %s", args.config, where, problem)
+            return 1
         version = str(config.get("snmp_version", "2c"))
         community = config["community"]
         timeout = int(config.get("timeout_seconds", 3))
@@ -128,6 +143,17 @@ def main() -> int:
         switch_retries = int(config.get("switch_retries", 1))
         max_concurrency = int(config.get("max_concurrency", 8))
         switch_ips = config["switches"]
+        # Optional web-UI login, used only to read SFP diagnostics.
+        web_credentials = None
+        if config.get("web_username") and config.get("web_password"):
+            web_credentials = (str(config["web_username"]), str(config["web_password"]))
+        else:
+            logger.info("No web_username/web_password in config: skipping SFP diagnostics.")
+        thresholds = health.Thresholds(
+            sfp_rx_min_dbm=float(config.get("sfp_rx_min_dbm", health.Thresholds.sfp_rx_min_dbm)),
+            sfp_rx_drop_db=float(config.get("sfp_rx_drop_db", health.Thresholds.sfp_rx_drop_db)),
+            sfp_temp_max_c=float(config.get("sfp_temp_max_c", health.Thresholds.sfp_temp_max_c)),
+        )
 
         # Each switch is collected independently and is I/O-bound (blocking on
         # UDP socket recv, which releases the GIL), so a thread pool collects
@@ -136,7 +162,8 @@ def main() -> int:
         workers = max(1, min(max_concurrency, len(switch_ips)))
         logger.debug("collecting %d switches with up to %d concurrent workers", len(switch_ips), workers)
         args_for = lambda ip: (
-            ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries
+            ip, community, version, timeout, retries, max_repetitions, pace_seconds, switch_retries,
+            web_credentials,
         )
         results_by_ip: dict = {}
         with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
@@ -158,7 +185,7 @@ def main() -> int:
 
         collected_at = save_switches(switches, cache_path)
         logger.debug("cached raw collected data to %s", cache_path)
-        port_health = (switches, collected_at, previous, previous_at)
+        port_health = (switches, collected_at, previous, previous_at, thresholds)
 
     topo = build_topology(switches)
     render_all(topo, args.output)
@@ -170,8 +197,8 @@ def main() -> int:
     # Skipped on --replot: there's no new snapshot to compare, and
     # rewriting port_health.csv from the cache would lose its deltas.
     if port_health is not None:
-        current, collected_at, previous, previous_at = port_health
-        results = health.check_ports(current, collected_at, previous, previous_at, topo)
+        current, collected_at, previous, previous_at, thresholds = port_health
+        results = health.check_ports(current, collected_at, previous, previous_at, topo, thresholds)
         health.write_port_health_csv(results, args.output / "port_health.csv")
         outputs.append(args.output / "port_health.csv")
         health.log_summary(results, collected_at, previous_at)

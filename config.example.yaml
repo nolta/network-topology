@@ -10,6 +10,16 @@ pace_seconds: 0       # delay between each SNMP table walk on a switch, if agent
 switch_retries: 1     # retry a switch's whole collection this many times before giving up on it
 max_concurrency: 8    # collect up to this many switches at once (set to 1 for serial, tidy per-switch verbose output)
 
+# Optional: web-UI login, used only to read SFP diagnostics (temperature,
+# laser bias, Tx/Rx optical power) from each switch's /stat/sfpinfo page.
+# Leave these out to skip SFP collection. Use a read-only account.
+# web_username: "monitor"
+# web_password: "..."
+# Port-health alert thresholds for SFPs (defaults shown):
+# sfp_rx_min_dbm: -18.0   # warn when Rx power is below this
+# sfp_rx_drop_db: 2.0     # warn when Rx power fell this much since the previous run
+# sfp_temp_max_c: 65.0    # warn when the module is this hot (standard SFPs are rated 0-70 C)
+
 switches:
   - 10.10.50.10
   - 10.10.50.11

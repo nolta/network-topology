@@ -98,11 +98,50 @@ mentions links that came up in the last 24 hours. `--replot` doesn't touch
 `port_health.csv`.
 
 To use it as a monitor, run the collection periodically (e.g. from cron);
-each run reports what changed since the one before. Optical diagnostics
-(SFP receive power, laser bias, temperature) aren't available: these
-switches don't expose them over SNMP (no ENTITY-SENSOR-MIB rows, nothing in
-the vendor MIBs), so a fiber link with too much attenuation only shows up
-here once it starts corrupting frames or dropping link.
+each run reports what changed since the one before.
+
+### SFP diagnostics
+
+Error counters only move once a fiber link is already corrupting frames.
+The optical readings warn earlier, but these switches don't expose them
+over SNMP (no ENTITY-SENSOR-MIB rows, nothing in the vendor MIBs), and
+their JSON-RPC API only reports SFP identity and alarm flags. The web UI's
+"SFP Module Information" page does show them, and gets them from a
+plain-text endpoint, `https://<switch>/stat/sfpinfo`. If `web_username` and
+`web_password` are set in `config.yaml`, each run reads that endpoint (GET
+only; a POST to it changes the switch's DDM trap settings) and records each
+module's wavelength, rated distance, temperature, supply voltage, laser
+bias and Tx/Rx power. Use a read-only web account. The switches'
+certificates are self-signed, so they aren't verified.
+
+Each run also calls the read-only JSON-RPC method `port.status.get`
+(`https://<switch>/json_rpc`, same login) for every module's vendor, part
+number, revision, serial number and type, and its Loss of Signal / Tx Fault
+alarms. (The SFP page's own type/speed fields are decoded unreliably by the
+switch, e.g. an FS 10GBASE-LR module shows as "100Base-FX", so they aren't
+used.)
+
+The readings are printed in a short "SFP modules" summary and added to
+`port_health.csv` (`sfp_*` columns). When both ends of a switch-to-switch
+link report power, `link_loss_db` is the far end's Tx minus this end's Rx,
+i.e. the actual loss in that direction. A port is flagged when its SFP:
+
+- receives less than `sfp_rx_min_dbm` (default -18 dBm; typical 1G
+  receivers work down to about -20 dBm),
+- receives `sfp_rx_drop_db` (default 2 dB) less than in the previous run, or
+- runs at `sfp_temp_max_c` (default 65 C) or hotter; standard SFPs are
+  rated 0-70 C, industrial ones (e.g. part numbers ending `-I`) usually
+  -40-85 C, so raise this if all your modules are industrial,
+- reports Loss of Signal (while the link is up, this means the received
+  light is at the module's own threshold), or
+- reports a Tx fault.
+
+Note that the Rx threshold assumes 1G optics. A 10G module running at 1G
+(as on the `.10`-`.14` link) is only specified down to about -14.4 dBm, so
+check the module's datasheet and set `sfp_rx_min_dbm` accordingly.
+
+A failure to read SFP data (wrong login, unreachable web UI) is logged as a
+warning and doesn't affect the rest of that switch's collection.
 
 ## How link discovery works
 

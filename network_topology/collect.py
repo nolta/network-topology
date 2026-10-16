@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import mibs
+from .sfp import SfpError, fetch_port_status, fetch_sfpinfo, match_interface
 from .snmp import SnmpError, get, mac_from_octets, walk
 
 logger = logging.getLogger(__name__)
@@ -17,8 +18,8 @@ logger = logging.getLogger(__name__)
 # are rejected rather than silently mis-loaded. Versions in
 # _COMPATIBLE_CACHE_VERSIONS only *added* fields with defaults, so they
 # still load (the new fields come back empty).
-_CACHE_VERSION = 2
-_COMPATIBLE_CACHE_VERSIONS = {1, 2}
+_CACHE_VERSION = 3
+_COMPATIBLE_CACHE_VERSIONS = {1, 2, 3}
 
 
 @dataclass
@@ -51,6 +52,9 @@ class SwitchData:
     # are cumulative since the switch booted; health.py diffs two
     # collections to see what's *increasing*.
     port_stats: dict = field(default_factory=dict)
+    # ifIndex -> SFP diagnostics (see sfp.parse_sfpinfo), for ports with a
+    # module. Only collected when web credentials are configured.
+    sfp: dict = field(default_factory=dict)
 
 
 # Per-port fields collected into SwitchData.port_stats, and the OID each
@@ -225,6 +229,38 @@ def _collect_port_stats(data, _walk, _walk_optional) -> None:
         data.port_stats[ifindex] = stats
 
 
+def _collect_sfp(host, data, web_credentials, timeout) -> None:
+    """Populate data.sfp from the web interface: DDM readings from the SFP
+    page and module identity/alarms from JSON-RPC. Best effort: SFP data
+    is a refinement, so a failure here is logged and the rest of the
+    switch's data is kept (and either source alone is still used)."""
+    username, password = web_credentials
+    timeout = max(timeout, 10)
+    try:
+        by_port = fetch_sfpinfo(host, username, password, timeout)
+    except SfpError as exc:
+        logger.warning("  no SFP diagnostics: %s", exc)
+        by_port = {}
+    for port, readings in by_port.items():
+        ifindex = data.bridge_port_to_ifindex.get(port)
+        if ifindex is None:
+            logger.debug("%s: SFP in port %s has no matching bridge port; skipped", host, port)
+            continue
+        data.sfp[ifindex] = readings
+
+    try:
+        by_key = fetch_port_status(host, username, password, timeout)
+    except SfpError as exc:
+        logger.warning("  no SFP module info: %s", exc)
+        return
+    for key, info in by_key.items():
+        ifindex = match_interface(key, data.ifindex_to_name)
+        if ifindex is None:
+            logger.debug("%s: no interface matches JSON-RPC port %r; skipped", host, key)
+            continue
+        data.sfp.setdefault(ifindex, {}).update(info)
+
+
 def collect_switch(
     host: str,
     community: str,
@@ -233,6 +269,7 @@ def collect_switch(
     retries: int = 1,
     max_repetitions: int = 10,
     pace_seconds: float = 0.0,
+    web_credentials: tuple[str, str] | None = None,
 ) -> SwitchData:
     logger.debug(
         "collect_switch %s starting (timeout=%ds retries=%d max_repetitions=%d pace_seconds=%.2f)",
@@ -336,6 +373,9 @@ def collect_switch(
     sys_uptime_vb = get(host, community, mibs.SYS_UPTIME, version, timeout, retries)
     data.sys_uptime = sys_uptime_vb.number if sys_uptime_vb else None
     _collect_port_stats(data, _walk, _walk_optional)
+
+    if web_credentials:
+        _collect_sfp(host, data, web_credentials, timeout)
 
     arp = _walk(mibs.IP_NET_TO_MEDIA_PHYS_ADDRESS)
     for index_suffix, vb in arp.items():
