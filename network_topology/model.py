@@ -58,6 +58,13 @@ class Link:
     device_b: str
     port_b: str
     kind: str  # "lldp" | "inferred" | "inferred-switch"
+    # VLANs carried, from the switch port(s) at either end (union). Empty
+    # when unknown. More than one VLAN makes the link a trunk.
+    vlans: list = field(default_factory=list)
+
+    @property
+    def is_trunk(self) -> bool:
+        return len(self.vlans) > 1
 
 
 @dataclass
@@ -345,7 +352,24 @@ def build_topology(switches: list[SwitchData]) -> Topology:
             )
 
     _merge_reciprocal_switch_links(topo)
+    _annotate_vlans(topo, switches_by_ip)
     return topo
+
+
+def _annotate_vlans(topo: Topology, switches_by_ip: dict) -> None:
+    """Fill in each link's VLANs from the switch port(s) at its ends.
+    Ports are matched by interface name, which is what LLDP port
+    descriptions and FDB-derived labels both use on these switches."""
+    port_vlans: dict[tuple[str, str], list] = {}
+    for ip, sw in switches_by_ip.items():
+        for bridge_port, vlans in sw.vlan_ports.items():
+            name = sw.ifindex_to_name.get(sw.bridge_port_to_ifindex.get(bridge_port))
+            if name:
+                port_vlans[(_switch_id(ip), name)] = vlans
+    for link in topo.links:
+        vlans = set(port_vlans.get((link.device_a, link.port_a), []))
+        vlans |= set(port_vlans.get((link.device_b, link.port_b), []))
+        link.vlans = sorted(vlans)
 
 
 def _merge_reciprocal_switch_links(topo: Topology) -> None:

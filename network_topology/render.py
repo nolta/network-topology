@@ -39,6 +39,16 @@ _EDGE_LEGEND = {
     "inferred-switch": ("Inferred switch uplink (FDB correlation)", "#fb8500", "solid", 2.8),
     "inferred": ("Inferred host/hub attachment (FDB/ARP)", "#999999", "dashed", 1.0),
 }
+# Trunks (links carrying more than one VLAN) get a wide translucent band
+# drawn *under* the normal line, so the line itself still shows how the
+# link was discovered.
+_TRUNK_COLOR = "#7b2cbf"
+_TRUNK_WIDTH = 9.0
+_TRUNK_ALPHA = 0.3
+
+
+def _vlan_list(vlans: list) -> str:
+    return ",".join(str(v) for v in vlans)
 
 
 def write_devices_csv(topo: Topology, path: Path) -> None:
@@ -53,7 +63,7 @@ def write_links_csv(topo: Topology, path: Path) -> None:
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(
-            ["device_a", "label_a", "port_a", "device_b", "label_b", "port_b", "link_type"]
+            ["device_a", "label_a", "port_a", "device_b", "label_b", "port_b", "link_type", "vlans"]
         )
         for link in topo.links:
             label_a = topo.devices[link.device_a].label
@@ -67,6 +77,7 @@ def write_links_csv(topo: Topology, path: Path) -> None:
                     label_b,
                     link.port_b,
                     link.kind,
+                    _vlan_list(link.vlans),
                 ]
             )
 
@@ -88,9 +99,15 @@ def write_dot(topo: Topology, path: Path) -> None:
             style, color = "solid", "#fb8500"
         else:
             style, color = "dashed", "#999999"
+        extra = ""
+        if link.is_trunk:
+            # "c:invis:c" draws as a double line in Graphviz.
+            edge_label += f"\\nVLANs {_vlan_list(link.vlans)}"
+            color = f"{_TRUNK_COLOR}:invis:{_TRUNK_COLOR}"
+            extra = ", penwidth=2"
         lines.append(
             f'  "{link.device_a}" -- "{link.device_b}" '
-            f'[label="{edge_label}", style={style}, color="{color}"];'
+            f'[label="{edge_label}", style={style}, color="{color}"{extra}];'
         )
     lines.append("}")
     path.write_text("\n".join(lines) + "\n")
@@ -248,6 +265,7 @@ def write_png(topo: Topology, path: Path) -> None:
             end_a=link.device_a,
             port_a=link.port_a,
             port_b=link.port_b,
+            vlans=link.vlans,
         )
 
     # Expand each hub pseudo-node: fan its member devices out behind it so
@@ -287,6 +305,10 @@ def write_png(topo: Topology, path: Path) -> None:
             edgecolors="#999999", linewidths=0.8,
         )
 
+    trunk_edges = [(u, v) for u, v, d in g.edges(data=True) if len(d.get("vlans") or []) > 1]
+    nx.draw_networkx_edges(
+        g, pos, edgelist=trunk_edges, width=_TRUNK_WIDTH, edge_color=_TRUNK_COLOR, alpha=_TRUNK_ALPHA
+    )
     lldp_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "lldp"]
     switch_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred-switch"]
     inferred_edges = [(u, v) for u, v, d in g.edges(data=True) if d.get("kind") == "inferred"]
@@ -301,6 +323,8 @@ def write_png(topo: Topology, path: Path) -> None:
         k for k, e in (("lldp", lldp_edges), ("inferred-switch", switch_edges), ("inferred", inferred_edges))
         if e
     ]
+    if trunk_edges:
+        present_edge_kinds.append("trunk")
 
     # Switch labels stay centered on the node (bold). Leaf/member labels are
     # anchored just outside the node and rotated along the node's radial, so
@@ -356,6 +380,20 @@ def write_png(topo: Topology, path: Path) -> None:
                 bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.85),
             )
 
+    # VLAN list at the middle of each trunk (port labels sit at 18%/82%).
+    for u, v in trunk_edges:
+        xu, yu = pos[u]
+        xv, yv = pos[v]
+        deg = math.degrees(math.atan2(yv - yu, xv - xu))
+        if deg > 90 or deg < -90:
+            deg += 180
+        plt.text(
+            (xu + xv) / 2, (yu + yv) / 2, "VLANs " + _vlan_list(g.edges[u, v]["vlans"]),
+            rotation=deg, rotation_mode="anchor", ha="center", va="center",
+            fontsize=7, color=_TRUNK_COLOR, fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=_TRUNK_COLOR, lw=0.6, alpha=0.9),
+        )
+
     _draw_legend(present_node_kinds, present_edge_kinds)
 
     plt.axis("off")
@@ -378,6 +416,12 @@ def _draw_legend(present_node_kinds: list, present_edge_kinds: list) -> None:
             )
         )
     for kind in present_edge_kinds:
+        if kind == "trunk":
+            handles.append(Line2D(
+                [], [], color=_TRUNK_COLOR, linewidth=_TRUNK_WIDTH, alpha=_TRUNK_ALPHA,
+                label="Trunk: carries multiple VLANs (listed on the link)",
+            ))
+            continue
         label, color, style, width = _EDGE_LEGEND[kind]
         handles.append(Line2D([], [], color=color, linestyle=style, linewidth=width, label=label))
 

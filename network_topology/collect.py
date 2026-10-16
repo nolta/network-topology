@@ -55,6 +55,9 @@ class SwitchData:
     # ifIndex -> SFP diagnostics (see sfp.parse_sfpinfo), for ports with a
     # module. Only collected when web credentials are configured.
     sfp: dict = field(default_factory=dict)
+    # bridge port -> sorted VLAN ids the port is a member of. A port in
+    # more than one VLAN is a trunk.
+    vlan_ports: dict = field(default_factory=dict)
 
 
 # Per-port fields collected into SwitchData.port_stats, and the OID each
@@ -200,6 +203,19 @@ def _collect_fdb(host, data, _walk, _walk_optional) -> None:
             continue
         mac = _mac_from_fdb_index(index_suffix)
         data.fdb.append((mac, port_vb.as_text()))
+
+
+def _collect_vlan_membership(data, _walk_optional) -> None:
+    """Populate data.vlan_ports from each VLAN's member-port bitmap.
+    Optional: without it links just aren't marked as trunks."""
+    for vlan, vb in _walk_optional(mibs.DOT1Q_VLAN_STATIC_EGRESS_PORTS).items():
+        for byte_index, byte in enumerate(vb.raw):
+            for bit in range(8):
+                if byte & (0x80 >> bit):
+                    port = str(byte_index * 8 + bit + 1)
+                    data.vlan_ports.setdefault(port, []).append(int(vlan))
+    for vlans in data.vlan_ports.values():
+        vlans.sort()
 
 
 def _collect_port_stats(data, _walk, _walk_optional) -> None:
@@ -368,6 +384,7 @@ def collect_switch(
         data.lldp_remote.append(entry)
 
     _collect_fdb(host, data, _walk, _walk_optional)
+    _collect_vlan_membership(data, _walk_optional)
     # Read uptime right before the port stats so ifLastChange (also in
     # uptime ticks) can be turned into a wall-clock time accurately.
     sys_uptime_vb = get(host, community, mibs.SYS_UPTIME, version, timeout, retries)

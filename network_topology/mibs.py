@@ -48,6 +48,10 @@ DOT1D_TP_FDB_STATUS = ".1.3.6.1.2.1.17.4.3.1.3"  # index = 6-byte MAC -> status 
 # so it maps through DOT1D_BASE_PORT_IF_INDEX the same way.
 DOT1Q_TP_FDB_PORT = ".1.3.6.1.2.1.17.7.1.2.2.1.2"  # index = VLAN.6-byte MAC -> bridge port
 DOT1Q_TP_FDB_STATUS = ".1.3.6.1.2.1.17.7.1.2.2.1.3"  # index = VLAN.6-byte MAC -> status (3 = learned)
+# index = VLAN -> PortList bitmap of member bridge ports (MSB of the first
+# byte is bridge port 1). The matching untagged-ports column isn't used:
+# on Planet it reflects each port's egress mode, not per-VLAN tagging.
+DOT1Q_VLAN_STATIC_EGRESS_PORTS = ".1.3.6.1.2.1.17.7.1.4.3.1.2"
 
 # IP-MIB (ARP table)
 IP_NET_TO_MEDIA_PHYS_ADDRESS = ".1.3.6.1.2.1.4.22.1.2"  # index = ifIndex.ipAddress -> MAC
